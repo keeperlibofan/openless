@@ -30,6 +30,19 @@ class FakeKeymap:
     pass
 
 
+class FakeDictationSuppressor:
+    def __init__(self, active: bool = False) -> None:
+        self.active = active
+        self.configured: list[HotkeySpec] = []
+
+    def configure(self, spec: HotkeySpec) -> bool:
+        self.configured.append(spec)
+        return self.active
+
+    def is_suppressing(self, _spec: HotkeySpec) -> bool:
+        return self.active
+
+
 class CommitTextTest(unittest.IsolatedAsyncioTestCase):
     async def test_commit_text_delegates_to_the_x11_inserter(self) -> None:
         class FakeInserter:
@@ -135,6 +148,66 @@ class CommitTextTest(unittest.IsolatedAsyncioTestCase):
         await interface.commit_text_when_safe("右 Ctrl 输入")
 
         self.assertEqual(inserter.received, [("右 Ctrl 输入", False)])
+
+    async def test_suppressed_alt_dictation_keeps_editor_focus_without_escape(
+        self,
+    ) -> None:
+        class FakeInserter:
+            def __init__(self) -> None:
+                self.received: list[tuple[str, bool]] = []
+
+            def insert(self, text: str, dismiss_alt_menu: bool = False) -> None:
+                self.received.append((text, dismiss_alt_menu))
+
+        hotkeys = HotkeyState(FakeKeymap())
+        hotkeys.dictation = HotkeySpec(sym=0xFFEA, primary_keycode=108)
+        suppressor = FakeDictationSuppressor(active=True)
+        inserter = FakeInserter()
+        interface = OpenLessInterface(
+            hotkeys=hotkeys,
+            text_inserter=inserter,
+            dictation_suppressor=suppressor,
+        )
+
+        await interface.commit_text_when_safe("VS Code 语音输入")
+
+        self.assertEqual(inserter.received, [("VS Code 语音输入", False)])
+
+
+class DictationSuppressionTest(unittest.TestCase):
+    def test_custom_alt_binding_configures_the_x11_suppressor(self) -> None:
+        class ConfigurableFakeKeymap:
+            def name_to_keysym(self, name: str) -> int:
+                return {"rightoption": 0xFFEA}[name]
+
+            def keysym_to_keycode(self, sym: int) -> int:
+                return {0xFFEA: 108}[sym]
+
+            def modifier_keycodes(self, _name: str) -> set[int]:
+                return set()
+
+        hotkeys = HotkeyState(ConfigurableFakeKeymap())
+        suppressor = FakeDictationSuppressor(active=True)
+        interface = OpenLessInterface(
+            hotkeys=hotkeys,
+            dictation_suppressor=suppressor,
+        )
+
+        interface.SetCustomDictationTrigger("rightoption")
+
+        self.assertEqual(len(suppressor.configured), 1)
+        self.assertEqual(suppressor.configured[0].sym, 0xFFEA)
+        self.assertEqual(suppressor.configured[0].primary_keycode, 108)
+
+    def test_alt_used_as_part_of_a_combo_is_not_modifier_only(self) -> None:
+        hotkeys = HotkeyState(FakeKeymap())
+        hotkeys.dictation = HotkeySpec(
+            sym=0xFFEA,
+            primary_keycode=108,
+            required_modifier_groups=[{37, 105}],
+        )
+
+        self.assertFalse(hotkeys.dictation_primary_is_alt())
 
 
 class PasteModifierGateTest(unittest.TestCase):

@@ -12,9 +12,13 @@ instead of requiring a desktop migration to Fcitx5.
 - Modifier-safe insertion: recognition/polishing may run during the next
   recording, while the actual synthetic paste waits for the dictation keys to
   be released so overlapping Right Alt cannot corrupt `Ctrl+V`.
-- Zotero/Firefox Alt-menu recovery: when the dictation trigger itself is left
-  or right Alt, Escape is emitted after release and before paste so the `V` in
-  `Ctrl+V` cannot activate the application's View menu instead of the editor.
+- Focus-preserving Alt suppression: a dedicated modifier-only left/right Alt
+  trigger is passively grabbed by the bridge. XInput2 still supplies recording
+  edges, but Zotero, VS Code/Electron, and other focused applications never see
+  the Alt key, so their menu layer cannot steal the editor/webview focus.
+- Zotero/Firefox fallback: if another client prevents the passive Alt grab,
+  Escape is still emitted after release and before paste to leave the menu
+  accelerator layer before the `V` in `Ctrl+V` is sent.
 - A rounded status overlay for recording, ASR, polishing, success, and errors.
 - Live microphone level visualization while recording.
 - Ordered-background-completion protection: an older result never covers a new

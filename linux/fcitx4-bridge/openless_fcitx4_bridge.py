@@ -39,6 +39,9 @@ from dbus_next.service import ServiceInterface, method, signal as dbus_signal
 BUS_NAME = "org.fcitx.Fcitx5"
 OBJECT_PATH = "/openless"
 OPENLESS_IFACE = "org.fcitx.Fcitx.OpenLess1"
+ALT_KEYSYMS = {0xFFE9, 0xFFEA}  # Alt_L / Alt_R
+X11_ANY_MODIFIER = 1 << 15
+X11_GRAB_MODE_ASYNC = 1
 
 LOG = logging.getLogger("openless-fcitx4-bridge")
 PREFERENCES_PATH = Path(
@@ -182,6 +185,162 @@ class HotkeySpec:
         return all(group & pressed for group in self.required_modifier_groups)
 
 
+class XErrorEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("resourceid", ctypes.c_ulong),
+        ("serial", ctypes.c_ulong),
+        ("error_code", ctypes.c_ubyte),
+        ("request_code", ctypes.c_ubyte),
+        ("minor_code", ctypes.c_ubyte),
+    ]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [("pad", ctypes.c_long * 24)]
+
+
+class X11DictationSuppressor:
+    """Keep a dedicated modifier-only Alt trigger away from focused apps.
+
+    XInput2 raw events remain visible to the bridge, while the passive X11
+    grab prevents Electron/Firefox applications from activating their menu
+    accelerator layer and losing the original editor or webview focus.
+    """
+
+    def __init__(self) -> None:
+        x11_path = ctypes.util.find_library("X11")
+        if not x11_path:
+            raise RuntimeError("libX11 was not found")
+        self._x11 = ctypes.CDLL(x11_path)
+        self._x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self._x11.XOpenDisplay.restype = ctypes.c_void_p
+        self._x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self._x11.XCloseDisplay.restype = ctypes.c_int
+        self._x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self._x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        self._x11.XGrabKey.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self._x11.XUngrabKey.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_ulong,
+        ]
+        self._x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._x11.XPending.argtypes = [ctypes.c_void_p]
+        self._x11.XPending.restype = ctypes.c_int
+        self._x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(XEvent)]
+        self._x11.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+        self._x11.XSetErrorHandler.restype = ctypes.c_void_p
+
+        self._display = self._x11.XOpenDisplay(None)
+        if not self._display:
+            raise RuntimeError(f"cannot open X display {os.environ.get('DISPLAY', '')!r}")
+        self._root = self._x11.XDefaultRootWindow(self._display)
+        self._active_keycode = 0
+        self._last_error_code = 0
+
+        error_handler_type = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.POINTER(XErrorEvent),
+        )
+
+        def capture_error(
+            _display: ctypes.c_void_p,
+            event: ctypes.POINTER(XErrorEvent),
+        ) -> int:
+            self._last_error_code = int(event.contents.error_code)
+            return 0
+
+        self._error_handler = error_handler_type(capture_error)
+
+    @staticmethod
+    def eligible(spec: HotkeySpec) -> bool:
+        return (
+            spec.enabled
+            and spec.sym in ALT_KEYSYMS
+            and spec.states == 0
+            and not spec.required_modifier_groups
+        )
+
+    def configure(self, spec: HotkeySpec) -> bool:
+        if self.is_suppressing(spec):
+            return True
+        self.clear()
+        if not self.eligible(spec):
+            return False
+
+        # XGrabKey reports conflicts asynchronously as BadAccess. Flush older
+        # errors, install a short-lived handler, and synchronise before
+        # deciding whether the fallback Escape path is still required.
+        self._x11.XSync(self._display, 0)
+        self._last_error_code = 0
+        previous_handler = self._x11.XSetErrorHandler(
+            ctypes.cast(self._error_handler, ctypes.c_void_p)
+        )
+        try:
+            self._x11.XGrabKey(
+                self._display,
+                spec.primary_keycode,
+                X11_ANY_MODIFIER,
+                self._root,
+                0,
+                X11_GRAB_MODE_ASYNC,
+                X11_GRAB_MODE_ASYNC,
+            )
+            self._x11.XSync(self._display, 0)
+        finally:
+            self._x11.XSetErrorHandler(previous_handler)
+
+        if self._last_error_code:
+            LOG.warning(
+                "cannot suppress dictation keycode=%s X11 error=%s; using focus-recovery fallback",
+                spec.primary_keycode,
+                self._last_error_code,
+            )
+            return False
+        self._active_keycode = spec.primary_keycode
+        LOG.info("suppressing modifier-only Alt keycode=%s", self._active_keycode)
+        return True
+
+    def is_suppressing(self, spec: HotkeySpec) -> bool:
+        return self.eligible(spec) and self._active_keycode == spec.primary_keycode
+
+    def drain_events(self) -> None:
+        event = XEvent()
+        while self._display and self._x11.XPending(self._display):
+            self._x11.XNextEvent(self._display, ctypes.byref(event))
+
+    def clear(self) -> None:
+        if not self._display or not self._active_keycode:
+            return
+        self._x11.XUngrabKey(
+            self._display,
+            self._active_keycode,
+            X11_ANY_MODIFIER,
+            self._root,
+        )
+        self._x11.XSync(self._display, 0)
+        self._active_keycode = 0
+
+    def close(self) -> None:
+        if not self._display:
+            return
+        self.clear()
+        self._x11.XCloseDisplay(self._display)
+        self._display = None
+
+
 class HotkeyState:
     def __init__(self, keymap: X11Keymap) -> None:
         self.keymap = keymap
@@ -220,7 +379,7 @@ class HotkeyState:
 
     def dictation_primary_is_alt(self) -> bool:
         """Whether the modifier-only trigger can leave an app menu focused."""
-        return self.dictation.sym in {0xFFE9, 0xFFEA}  # Alt_L / Alt_R
+        return X11DictationSuppressor.eligible(self.dictation)
 
     async def wait_for_dictation_input_keys_released(self) -> None:
         """Pause synthetic paste until the recording shortcut is fully released."""
@@ -358,16 +517,39 @@ class OpenLessInterface(ServiceInterface):
         text_inserter: object | None = None,
         status_overlay: object | None = None,
         history_refresher: object | None = None,
+        dictation_suppressor: object | None = None,
     ) -> None:
         super().__init__(OPENLESS_IFACE)
         self.hotkeys = hotkeys
         self.text_inserter = text_inserter or X11TextInserter()
         self.status_overlay = status_overlay or StatusOverlay()
         self.history_refresher = history_refresher or HistoryRefresher()
+        self.dictation_suppressor = dictation_suppressor
+
+    def configure_dictation_suppression(self) -> bool:
+        if self.hotkeys is None or self.dictation_suppressor is None:
+            return False
+        try:
+            return bool(self.dictation_suppressor.configure(self.hotkeys.dictation))
+        except Exception as exc:
+            LOG.warning("dictation-key suppression failed: %s", type(exc).__name__)
+            return False
+
+    def dictation_alt_is_suppressed(self) -> bool:
+        if self.hotkeys is None or self.dictation_suppressor is None:
+            return False
+        try:
+            return bool(
+                self.dictation_suppressor.is_suppressing(self.hotkeys.dictation)
+            )
+        except Exception:
+            return False
 
     async def commit_text_when_safe(self, text: str) -> None:
         dismiss_alt_menu = (
-            self.hotkeys is not None and self.hotkeys.dictation_primary_is_alt()
+            self.hotkeys is not None
+            and self.hotkeys.dictation_primary_is_alt()
+            and not self.dictation_alt_is_suppressed()
         )
         if self.hotkeys is not None and self.hotkeys.dictation_input_keys_pressed():
             LOG.info("deferring text insertion until dictation hotkey is fully released")
@@ -414,18 +596,21 @@ class OpenLessInterface(ServiceInterface):
     def SetHotkey(self, keys: "as") -> "":
         value = keys[0] if keys else ""
         self.hotkeys.dictation = self.hotkeys.from_string(value)
+        self.configure_dictation_suppression()
         LOG.info("dictation hotkey string=%s keycode=%s", value, self.hotkeys.dictation.primary_keycode)
         return None
 
     @method()
     def SetHotkeyRaw(self, sym: "u", states: "u") -> "":
         self.hotkeys.dictation = self.hotkeys.from_raw(sym, states)
+        self.configure_dictation_suppression()
         LOG.info("dictation hotkey sym=%#x keycode=%s", sym, self.hotkeys.dictation.primary_keycode)
         return None
 
     @method()
     def SetCustomDictationTrigger(self, key_string: "s") -> "":
         self.hotkeys.dictation = self.hotkeys.from_string(key_string)
+        self.configure_dictation_suppression()
         LOG.info(
             "custom dictation hotkey=%s keycode=%s",
             key_string,
@@ -493,6 +678,9 @@ async def monitor_xinput(interface: OpenLessInterface) -> None:
             current_event = None
 
             was_pressed = hotkeys.update_pressed(keycode, is_press)
+            if interface.dictation_suppressor is not None:
+                with contextlib.suppress(Exception):
+                    interface.dictation_suppressor.drain_events()
 
             # Suppress X11 auto-repeat for modifier-only/toggle bindings.
             if is_press and was_pressed:
@@ -535,7 +723,16 @@ async def main() -> None:
     keymap = X11Keymap()
     hotkeys = HotkeyState(keymap)
     status_overlay = StatusOverlay()
-    openless = OpenLessInterface(hotkeys, status_overlay=status_overlay)
+    try:
+        dictation_suppressor: X11DictationSuppressor | None = X11DictationSuppressor()
+    except Exception as exc:
+        LOG.warning("X11 dictation-key suppression unavailable: %s", type(exc).__name__)
+        dictation_suppressor = None
+    openless = OpenLessInterface(
+        hotkeys,
+        status_overlay=status_overlay,
+        dictation_suppressor=dictation_suppressor,
+    )
     bus = await MessageBus().connect()
     bus.export(OBJECT_PATH, openless)
     await bus.request_name(BUS_NAME)
@@ -554,6 +751,8 @@ async def main() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await monitor
         status_overlay.close()
+        if dictation_suppressor is not None:
+            dictation_suppressor.close()
         bus.disconnect()
         keymap.close()
 
