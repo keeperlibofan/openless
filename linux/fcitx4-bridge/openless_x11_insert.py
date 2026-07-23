@@ -15,6 +15,35 @@ import time
 import tkinter as tk
 
 
+# X11 core modifier masks. LockMask (Caps Lock) and Mod2Mask (normally Num
+# Lock) do not alter Ctrl+V, so they are intentionally excluded. Right Alt is
+# commonly Mod1 or Mod5 depending on the keyboard layout; both are blocked.
+BLOCKING_PASTE_MODIFIER_MASK = (
+    (1 << 0)  # ShiftMask
+    | (1 << 2)  # ControlMask
+    | (1 << 3)  # Mod1Mask (usually Alt)
+    | (1 << 5)  # Mod3Mask
+    | (1 << 6)  # Mod4Mask (usually Super)
+    | (1 << 7)  # Mod5Mask (often AltGr / Right Alt)
+)
+
+
+def wait_for_paste_modifiers_released(
+    query_modifier_mask,
+    *,
+    timeout: float = 180.0,
+    poll_interval: float = 0.01,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> None:
+    """Wait until physical modifiers can no longer turn Ctrl+V into another chord."""
+    deadline = monotonic() + timeout
+    while query_modifier_mask() & BLOCKING_PASTE_MODIFIER_MASK:
+        if monotonic() >= deadline:
+            raise RuntimeError("timed out waiting for physical modifier release")
+        sleep(poll_interval)
+
+
 def pump_events(root: tk.Tk, seconds: float) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -37,6 +66,20 @@ def send_ctrl_v() -> None:
     x11.XStringToKeysym.restype = ctypes.c_ulong
     x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
     x11.XKeysymToKeycode.restype = ctypes.c_uint
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XQueryPointer.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    x11.XQueryPointer.restype = ctypes.c_int
     x11.XFlush.argtypes = [ctypes.c_void_p]
     xtst.XTestFakeKeyEvent.argtypes = [
         ctypes.c_void_p,
@@ -54,6 +97,34 @@ def send_ctrl_v() -> None:
         v_key = x11.XKeysymToKeycode(display, x11.XStringToKeysym(b"v"))
         if not control or not v_key:
             raise RuntimeError("cannot resolve Ctrl+V keycodes")
+
+        root_window = x11.XDefaultRootWindow(display)
+
+        def query_modifier_mask() -> int:
+            root_return = ctypes.c_ulong()
+            child_return = ctypes.c_ulong()
+            root_x = ctypes.c_int()
+            root_y = ctypes.c_int()
+            win_x = ctypes.c_int()
+            win_y = ctypes.c_int()
+            mask = ctypes.c_uint()
+            if not x11.XQueryPointer(
+                display,
+                root_window,
+                ctypes.byref(root_return),
+                ctypes.byref(child_return),
+                ctypes.byref(root_x),
+                ctypes.byref(root_y),
+                ctypes.byref(win_x),
+                ctypes.byref(win_y),
+                ctypes.byref(mask),
+            ):
+                raise RuntimeError("XQueryPointer failed")
+            return int(mask.value)
+
+        # Close the race where the recording key is pressed after the bridge's
+        # async safety check but before the helper actually emits Ctrl+V.
+        wait_for_paste_modifiers_released(query_modifier_mask)
         for keycode, pressed in (
             (control, 1),
             (v_key, 1),

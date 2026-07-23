@@ -15,6 +15,12 @@ const DEST: &str = "org.fcitx.Fcitx5";
 const PATH: &str = "/openless";
 const IFACE: &str = "org.fcitx.Fcitx.OpenLess1";
 const TIMEOUT: Duration = Duration::from_secs(3);
+// CommitText may intentionally wait while the next hold-to-record shortcut is
+// physically down. Keep ordinary DBus configuration/status calls fast, but
+// allow a long recording to finish before the bridge emits its synthetic
+// Ctrl+V; otherwise the three-second timeout turns a safe deferral into a
+// partial-stream failure.
+const COMMIT_TEXT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// 通过 fcitx5 插件向当前焦点输入上下文提交文字。
 ///
@@ -25,7 +31,7 @@ pub fn commit_text(text: &str) -> Result<(), String> {
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "CommitText")
         .map_err(|e| format!("build msg: {e}"))?
         .append1(text);
-    conn.send_with_reply_and_block(msg, TIMEOUT)
+    conn.send_with_reply_and_block(msg, COMMIT_TEXT_TIMEOUT)
         .map_err(|e| format!("CommitText: {e}"))?;
     Ok(())
 }

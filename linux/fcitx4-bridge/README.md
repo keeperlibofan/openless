@@ -9,6 +9,9 @@ instead of requiring a desktop migration to Fcitx5.
 - Right-side modifier-aware global hotkeys from XInput2 raw key events.
 - Hold-to-record and toggle modes without losing physical release edges.
 - Focused-window text insertion through an X11 clipboard owner and XTest.
+- Modifier-safe insertion: recognition/polishing may run during the next
+  recording, while the actual synthetic paste waits for the dictation keys to
+  be released so overlapping Right Alt cannot corrupt `Ctrl+V`.
 - A rounded status overlay for recording, ASR, polishing, success, and errors.
 - Live microphone level visualization while recording.
 - Ordered-background-completion protection: an older result never covers a new

@@ -189,6 +189,45 @@ class HotkeyState:
         self.qa = HotkeySpec()
         self.translation = HotkeySpec()
         self.pressed: set[int] = set()
+        self._pressed_changed = asyncio.Event()
+
+    def update_pressed(self, keycode: int, is_press: bool) -> bool:
+        """Update physical key state and wake insertion waiters.
+
+        Returns whether the key was already pressed before this edge, which is
+        used by the XInput monitor to suppress auto-repeat presses.
+        """
+        was_pressed = keycode in self.pressed
+        if is_press:
+            self.pressed.add(keycode)
+        else:
+            self.pressed.discard(keycode)
+        self._pressed_changed.set()
+        return was_pressed
+
+    def reset_pressed(self) -> None:
+        self.pressed.clear()
+        self._pressed_changed.set()
+
+    def dictation_input_keys_pressed(self) -> bool:
+        """Whether any physical key belonging to the dictation binding is held."""
+        spec = self.dictation
+        if not spec.enabled:
+            return False
+        if spec.primary_keycode in self.pressed:
+            return True
+        return any(group & self.pressed for group in spec.required_modifier_groups)
+
+    async def wait_for_dictation_input_keys_released(self) -> None:
+        """Pause synthetic paste until the recording shortcut is fully released."""
+        while self.dictation_input_keys_pressed():
+            self._pressed_changed.clear()
+            # Close the clear/check race: an edge between the loop condition
+            # and Event.clear() either makes the binding safe now or leaves the
+            # Event set for the await below.
+            if not self.dictation_input_keys_pressed():
+                break
+            await self._pressed_changed.wait()
 
     def from_raw(self, sym: int, states: int) -> HotkeySpec:
         return HotkeySpec(
@@ -224,7 +263,7 @@ class X11TextInserter:
                 text=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=4,
+                timeout=185,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -316,10 +355,20 @@ class OpenLessInterface(ServiceInterface):
         self.status_overlay = status_overlay or StatusOverlay()
         self.history_refresher = history_refresher or HistoryRefresher()
 
+    async def commit_text_when_safe(self, text: str) -> None:
+        if self.hotkeys is not None and self.hotkeys.dictation_input_keys_pressed():
+            LOG.info("deferring text insertion until dictation hotkey is fully released")
+            await self.hotkeys.wait_for_dictation_input_keys_released()
+        # The helper owns the clipboard for about one second. Run it outside
+        # the event-loop thread so RawKeyRelease is consumed promptly;
+        # otherwise the release needed to unblock insertion would deadlock
+        # behind subprocess.run().
+        await asyncio.to_thread(self.text_inserter.insert, text)
+
     @method()
-    def CommitText(self, _text: "s") -> "":
+    async def CommitText(self, _text: "s") -> "":
         try:
-            self.text_inserter.insert(_text)
+            await self.commit_text_when_safe(_text)
         except Exception as exc:
             raise DBusError(
                 "org.openless.Fcitx4Bridge.InsertionFailed",
@@ -401,6 +450,11 @@ DETAIL_RE = re.compile(r"\s*detail:\s*(\d+)")
 async def monitor_xinput(interface: OpenLessInterface) -> None:
     hotkeys = interface.hotkeys
     while True:
+        # A listener restart loses the previous stream's release edges. Clear
+        # stale state so insertion waiters cannot remain blocked forever; the
+        # X11 helper independently re-checks the real modifier mask immediately
+        # before synthesizing Ctrl+V.
+        hotkeys.reset_pressed()
         process = await asyncio.create_subprocess_exec(
             "stdbuf",
             "-oL",
@@ -425,11 +479,7 @@ async def monitor_xinput(interface: OpenLessInterface) -> None:
             is_press = current_event == "RawKeyPress"
             current_event = None
 
-            was_pressed = keycode in hotkeys.pressed
-            if is_press:
-                hotkeys.pressed.add(keycode)
-            else:
-                hotkeys.pressed.discard(keycode)
+            was_pressed = hotkeys.update_pressed(keycode, is_press)
 
             # Suppress X11 auto-repeat for modifier-only/toggle bindings.
             if is_press and was_pressed:

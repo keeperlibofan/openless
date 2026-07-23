@@ -25,6 +25,10 @@ reinstallation. It intentionally contains no credential value.
   insertion, and history persistence.
 - Results are always inserted in capture order.
 - Starting a later capture never cancels or overwrites an older queued capture.
+- Recognition and polishing continue while a later hold-to-record capture is
+  active, but the Linux synthetic paste is deferred until the recording
+  shortcut is fully released. This prevents a physical Right Alt from turning
+  the bridge's `Ctrl+V` into `Ctrl+Alt+V` and silently dropping text.
 
 ## Linux desktop integration
 
