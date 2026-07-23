@@ -29,6 +29,10 @@ reinstallation. It intentionally contains no credential value.
   active, but the Linux synthetic paste is deferred until the recording
   shortcut is fully released. This prevents a physical Right Alt from turning
   the bridge's `Ctrl+V` into `Ctrl+Alt+V` and silently dropping text.
+- Modifier-only Alt triggers can leave Firefox/XUL applications such as Zotero
+  focused on their menu accelerator layer. For Alt-based dictation only, the
+  bridge sends Escape after release and before `Ctrl+V`, returning focus to the
+  previous LM/chat editor instead of opening Zotero's View menu.
 
 ## Linux desktop integration
 

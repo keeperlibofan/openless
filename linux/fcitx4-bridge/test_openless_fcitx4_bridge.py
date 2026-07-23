@@ -11,6 +11,7 @@ from openless_fcitx4_bridge import (
 )
 from openless_x11_insert import (
     BLOCKING_PASTE_MODIFIER_MASK,
+    paste_key_sequence,
     wait_for_paste_modifiers_released,
 )
 
@@ -33,25 +34,25 @@ class CommitTextTest(unittest.IsolatedAsyncioTestCase):
     async def test_commit_text_delegates_to_the_x11_inserter(self) -> None:
         class FakeInserter:
             def __init__(self) -> None:
-                self.received: list[str] = []
+                self.received: list[tuple[str, bool]] = []
 
-            def insert(self, text: str) -> None:
-                self.received.append(text)
+            def insert(self, text: str, dismiss_alt_menu: bool = False) -> None:
+                self.received.append((text, dismiss_alt_menu))
 
         inserter = FakeInserter()
         interface = OpenLessInterface(hotkeys=None, text_inserter=inserter)
 
         await interface.commit_text_when_safe("测试文字")
 
-        self.assertEqual(inserter.received, ["测试文字"])
+        self.assertEqual(inserter.received, [("测试文字", False)])
 
     async def test_commit_text_waits_for_dictation_primary_release(self) -> None:
         class FakeInserter:
             def __init__(self) -> None:
-                self.received: list[str] = []
+                self.received: list[tuple[str, bool]] = []
 
-            def insert(self, text: str) -> None:
-                self.received.append(text)
+            def insert(self, text: str, dismiss_alt_menu: bool = False) -> None:
+                self.received.append((text, dismiss_alt_menu))
 
         hotkeys = HotkeyState(FakeKeymap())
         hotkeys.dictation = HotkeySpec(primary_keycode=108)
@@ -68,15 +69,15 @@ class CommitTextTest(unittest.IsolatedAsyncioTestCase):
         hotkeys.update_pressed(108, False)
         await asyncio.wait_for(insertion, timeout=1)
 
-        self.assertEqual(inserter.received, ["第一段完整文字"])
+        self.assertEqual(inserter.received, [("第一段完整文字", False)])
 
     async def test_commit_text_waits_for_combo_modifier_release(self) -> None:
         class FakeInserter:
             def __init__(self) -> None:
-                self.received: list[str] = []
+                self.received: list[tuple[str, bool]] = []
 
-            def insert(self, text: str) -> None:
-                self.received.append(text)
+            def insert(self, text: str, dismiss_alt_menu: bool = False) -> None:
+                self.received.append((text, dismiss_alt_menu))
 
         hotkeys = HotkeyState(FakeKeymap())
         hotkeys.dictation = HotkeySpec(
@@ -99,7 +100,41 @@ class CommitTextTest(unittest.IsolatedAsyncioTestCase):
         hotkeys.update_pressed(37, False)
         await asyncio.wait_for(insertion, timeout=1)
 
-        self.assertEqual(inserter.received, ["组合键录音结果"])
+        self.assertEqual(inserter.received, [("组合键录音结果", False)])
+
+    async def test_alt_dictation_requests_menu_dismissal_before_paste(self) -> None:
+        class FakeInserter:
+            def __init__(self) -> None:
+                self.received: list[tuple[str, bool]] = []
+
+            def insert(self, text: str, dismiss_alt_menu: bool = False) -> None:
+                self.received.append((text, dismiss_alt_menu))
+
+        hotkeys = HotkeyState(FakeKeymap())
+        hotkeys.dictation = HotkeySpec(sym=0xFFEA, primary_keycode=108)
+        inserter = FakeInserter()
+        interface = OpenLessInterface(hotkeys=hotkeys, text_inserter=inserter)
+
+        await interface.commit_text_when_safe("Zotero 语音输入")
+
+        self.assertEqual(inserter.received, [("Zotero 语音输入", True)])
+
+    async def test_non_alt_dictation_does_not_send_escape(self) -> None:
+        class FakeInserter:
+            def __init__(self) -> None:
+                self.received: list[tuple[str, bool]] = []
+
+            def insert(self, text: str, dismiss_alt_menu: bool = False) -> None:
+                self.received.append((text, dismiss_alt_menu))
+
+        hotkeys = HotkeyState(FakeKeymap())
+        hotkeys.dictation = HotkeySpec(sym=0xFFE4, primary_keycode=105)
+        inserter = FakeInserter()
+        interface = OpenLessInterface(hotkeys=hotkeys, text_inserter=inserter)
+
+        await interface.commit_text_when_safe("右 Ctrl 输入")
+
+        self.assertEqual(inserter.received, [("右 Ctrl 输入", False)])
 
 
 class PasteModifierGateTest(unittest.TestCase):
@@ -121,6 +156,28 @@ class PasteModifierGateTest(unittest.TestCase):
         )
 
         self.assertEqual(sleeps, [0.01, 0.01])
+
+    def test_alt_menu_escape_precedes_ctrl_v(self) -> None:
+        self.assertEqual(
+            paste_key_sequence(
+                control_keycode=37,
+                v_keycode=55,
+                escape_keycode=9,
+                dismiss_alt_menu=True,
+            ),
+            ((9, 1), (9, 0), (37, 1), (55, 1), (55, 0), (37, 0)),
+        )
+
+    def test_regular_paste_does_not_send_escape(self) -> None:
+        self.assertEqual(
+            paste_key_sequence(
+                control_keycode=37,
+                v_keycode=55,
+                escape_keycode=9,
+                dismiss_alt_menu=False,
+            ),
+            ((37, 1), (55, 1), (55, 0), (37, 0)),
+        )
 
 
 class StatusOverlayTest(unittest.TestCase):

@@ -218,6 +218,10 @@ class HotkeyState:
             return True
         return any(group & self.pressed for group in spec.required_modifier_groups)
 
+    def dictation_primary_is_alt(self) -> bool:
+        """Whether the modifier-only trigger can leave an app menu focused."""
+        return self.dictation.sym in {0xFFE9, 0xFFEA}  # Alt_L / Alt_R
+
     async def wait_for_dictation_input_keys_released(self) -> None:
         """Pause synthetic paste until the recording shortcut is fully released."""
         while self.dictation_input_keys_pressed():
@@ -255,12 +259,18 @@ class HotkeyState:
 
 
 class X11TextInserter:
-    def insert(self, text: str) -> None:
+    def insert(self, text: str, dismiss_alt_menu: bool = False) -> None:
+        env = os.environ.copy()
+        if dismiss_alt_menu:
+            env["OPENLESS_DISMISS_ALT_MENU"] = "1"
+        else:
+            env.pop("OPENLESS_DISMISS_ALT_MENU", None)
         try:
             result = subprocess.run(
                 ["/usr/bin/python3", str(X11_INSERTER_PATH)],
                 input=text,
                 text=True,
+                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=185,
@@ -356,6 +366,9 @@ class OpenLessInterface(ServiceInterface):
         self.history_refresher = history_refresher or HistoryRefresher()
 
     async def commit_text_when_safe(self, text: str) -> None:
+        dismiss_alt_menu = (
+            self.hotkeys is not None and self.hotkeys.dictation_primary_is_alt()
+        )
         if self.hotkeys is not None and self.hotkeys.dictation_input_keys_pressed():
             LOG.info("deferring text insertion until dictation hotkey is fully released")
             await self.hotkeys.wait_for_dictation_input_keys_released()
@@ -363,7 +376,7 @@ class OpenLessInterface(ServiceInterface):
         # the event-loop thread so RawKeyRelease is consumed promptly;
         # otherwise the release needed to unblock insertion would deadlock
         # behind subprocess.run().
-        await asyncio.to_thread(self.text_inserter.insert, text)
+        await asyncio.to_thread(self.text_inserter.insert, text, dismiss_alt_menu)
 
     @method()
     async def CommitText(self, _text: "s") -> "":

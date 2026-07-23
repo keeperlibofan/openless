@@ -12,6 +12,9 @@ instead of requiring a desktop migration to Fcitx5.
 - Modifier-safe insertion: recognition/polishing may run during the next
   recording, while the actual synthetic paste waits for the dictation keys to
   be released so overlapping Right Alt cannot corrupt `Ctrl+V`.
+- Zotero/Firefox Alt-menu recovery: when the dictation trigger itself is left
+  or right Alt, Escape is emitted after release and before paste so the `V` in
+  `Ctrl+V` cannot activate the application's View menu instead of the editor.
 - A rounded status overlay for recording, ASR, polishing, success, and errors.
 - Live microphone level visualization while recording.
 - Ordered-background-completion protection: an older result never covers a new

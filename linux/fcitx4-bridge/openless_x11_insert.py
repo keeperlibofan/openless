@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import os
 import sys
 import time
 import tkinter as tk
@@ -44,6 +45,28 @@ def wait_for_paste_modifiers_released(
         sleep(poll_interval)
 
 
+def paste_key_sequence(
+    *,
+    control_keycode: int,
+    v_keycode: int,
+    escape_keycode: int,
+    dismiss_alt_menu: bool,
+) -> tuple[tuple[int, int], ...]:
+    """Build the exact key sequence used by the X11 paste helper."""
+    events: list[tuple[int, int]] = []
+    if dismiss_alt_menu:
+        events.extend(((escape_keycode, 1), (escape_keycode, 0)))
+    events.extend(
+        (
+            (control_keycode, 1),
+            (v_keycode, 1),
+            (v_keycode, 0),
+            (control_keycode, 0),
+        )
+    )
+    return tuple(events)
+
+
 def pump_events(root: tk.Tk, seconds: float) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -51,7 +74,7 @@ def pump_events(root: tk.Tk, seconds: float) -> None:
         time.sleep(0.01)
 
 
-def send_ctrl_v() -> None:
+def send_ctrl_v(dismiss_alt_menu: bool = False) -> None:
     x11_path = ctypes.util.find_library("X11")
     xtst_path = ctypes.util.find_library("Xtst")
     if not x11_path or not xtst_path:
@@ -95,8 +118,9 @@ def send_ctrl_v() -> None:
     try:
         control = x11.XKeysymToKeycode(display, 0xFFE3)  # Control_L
         v_key = x11.XKeysymToKeycode(display, x11.XStringToKeysym(b"v"))
-        if not control or not v_key:
-            raise RuntimeError("cannot resolve Ctrl+V keycodes")
+        escape = x11.XKeysymToKeycode(display, 0xFF1B)  # Escape
+        if not control or not v_key or not escape:
+            raise RuntimeError("cannot resolve Escape/Ctrl+V keycodes")
 
         root_window = x11.XDefaultRootWindow(display)
 
@@ -125,14 +149,21 @@ def send_ctrl_v() -> None:
         # Close the race where the recording key is pressed after the bridge's
         # async safety check but before the helper actually emits Ctrl+V.
         wait_for_paste_modifiers_released(query_modifier_mask)
-        for keycode, pressed in (
-            (control, 1),
-            (v_key, 1),
-            (v_key, 0),
-            (control, 0),
-        ):
+        events = paste_key_sequence(
+            control_keycode=control,
+            v_keycode=v_key,
+            escape_keycode=escape,
+            dismiss_alt_menu=dismiss_alt_menu,
+        )
+        for index, (keycode, pressed) in enumerate(events):
             if not xtst.XTestFakeKeyEvent(display, keycode, pressed, 0):
                 raise RuntimeError("XTestFakeKeyEvent failed")
+            if dismiss_alt_menu and index == 1:
+                # Firefox/XUL applications such as Zotero activate the menu bar
+                # after a modifier-only Alt release. Escape returns focus to
+                # the previous editor before the V in Ctrl+V can open View.
+                x11.XFlush(display)
+                time.sleep(0.12)
         x11.XFlush(display)
     finally:
         x11.XCloseDisplay(display)
@@ -150,7 +181,7 @@ def main() -> int:
         root.clipboard_append(text)
         root.update()
         pump_events(root, 0.08)
-        send_ctrl_v()
+        send_ctrl_v(os.environ.get("OPENLESS_DISMISS_ALT_MENU") == "1")
         # Keep ownership while Chromium/GTK completes its asynchronous
         # clipboard request.  The helper remains hidden and never takes focus.
         pump_events(root, 1.0)
