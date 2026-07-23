@@ -32,7 +32,9 @@ fn try_accessibility(inserter: &TextInserter, text: &str) -> Option<InsertStatus
     // 保存粘贴前的剪贴板内容，粘贴完成后还原，避免静默覆盖用户剪贴板。
     let previous_clip: Option<String> =
         crate::android::jni::android::with_android_env(|env, context| {
-            Ok(crate::android::jni::android::get_primary_clip_text(env, context))
+            Ok(crate::android::jni::android::get_primary_clip_text(
+                env, context,
+            ))
         })
         .ok()
         .flatten();
@@ -50,11 +52,9 @@ fn try_accessibility(inserter: &TextInserter, text: &str) -> Option<InsertStatus
     // 还原用户原有剪贴板内容（仅当粘贴成功时还原；失败时用户需要自己处理）。
     if matches!(result, Some(InsertStatus::Inserted)) {
         if let Some(prev) = previous_clip {
-            if let Err(e) =
-                crate::android::jni::android::with_android_env(|env, context| {
-                    crate::android::jni::android::set_primary_clip_text(env, context, &prev)
-                })
-            {
+            if let Err(e) = crate::android::jni::android::with_android_env(|env, context| {
+                crate::android::jni::android::set_primary_clip_text(env, context, &prev)
+            }) {
                 log::warn!("[android-insert] failed to restore clipboard: {e}");
             }
         }

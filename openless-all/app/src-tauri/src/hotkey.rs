@@ -12,7 +12,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 
@@ -21,8 +21,8 @@ use crate::types::{HotkeyAdapterKind, HotkeyBinding, HotkeyCapability, HotkeyIns
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyEvent {
-    Pressed { at: Instant },
-    Released { at: Instant },
+    Pressed,
+    Released,
     Cancelled,
     /// Shift（或未来配置项指定的修饰键）按下边沿。可在录音过程中任何时刻产生；
     /// 上层据此切换到翻译输出管线。详见 issue #4。
@@ -465,9 +465,7 @@ mod platform {
         tx: Sender<HotkeyEvent>,
         status_tx: StartupTx<Arc<MacShutdownHandles>>,
     ) {
-        let mask: CgEventMask = (1u64 << FLAGS_CHANGED)
-            | (1u64 << KEY_DOWN)
-            | (1u64 << KEY_UP);
+        let mask: CgEventMask = (1u64 << FLAGS_CHANGED) | (1u64 << KEY_DOWN) | (1u64 << KEY_UP);
         let handles = Arc::new(MacShutdownHandles {
             tap: std::sync::Mutex::new(None),
             runloop: std::sync::Mutex::new(None),
@@ -598,10 +596,10 @@ mod platform {
 
         if is_active && !was_held {
             ctx.shared.trigger_held.store(true, Ordering::SeqCst);
-            send_or_log(&ctx.tx, HotkeyEvent::Pressed { at: std::time::Instant::now() });
+            send_or_log(&ctx.tx, HotkeyEvent::Pressed);
         } else if !is_active && was_held {
             ctx.shared.trigger_held.store(false, Ordering::SeqCst);
-            send_or_log(&ctx.tx, HotkeyEvent::Released { at: std::time::Instant::now() });
+            send_or_log(&ctx.tx, HotkeyEvent::Released);
         }
     }
 
@@ -706,14 +704,6 @@ mod platform {
 
         fn drain(rx: &mpsc::Receiver<HotkeyEvent>) -> Vec<HotkeyEvent> {
             rx.try_iter().collect()
-        }
-
-        fn edge_names(events: Vec<HotkeyEvent>) -> Vec<&'static str> {
-            events.into_iter().filter_map(|event| match event {
-                HotkeyEvent::Pressed { .. } => Some("pressed"),
-                HotkeyEvent::Released { .. } => Some("released"),
-                _ => None,
-            }).collect()
         }
 
         #[test]
@@ -1012,14 +1002,14 @@ mod platform {
                 let was_held = ctx.shared.trigger_held.swap(true, Ordering::SeqCst);
                 if !was_held {
                     log::info!("[hotkey] Windows trigger pressed vk={vk_code}");
-                    send_or_log(&ctx.tx, HotkeyEvent::Pressed { at: std::time::Instant::now() });
+                    send_or_log(&ctx.tx, HotkeyEvent::Pressed);
                 }
             }
             WM_KEYUP | WM_SYSKEYUP => {
                 let was_held = ctx.shared.trigger_held.swap(false, Ordering::SeqCst);
                 if was_held {
                     log::info!("[hotkey] Windows trigger released vk={vk_code}");
-                    send_or_log(&ctx.tx, HotkeyEvent::Released { at: std::time::Instant::now() });
+                    send_or_log(&ctx.tx, HotkeyEvent::Released);
                 }
             }
             _ => {}
@@ -1117,17 +1107,6 @@ mod platform {
             rx.try_iter().collect()
         }
 
-        fn edge_names(events: Vec<HotkeyEvent>) -> Vec<&'static str> {
-            events
-                .into_iter()
-                .filter_map(|event| match event {
-                    HotkeyEvent::Pressed { .. } => Some("pressed"),
-                    HotkeyEvent::Released { .. } => Some("released"),
-                    _ => None,
-                })
-                .collect()
-        }
-
         #[test]
         fn windows_modifier_edges_are_deduped_from_mock_hook_events() {
             let shared = shared(HotkeyTrigger::RightControl);
@@ -1139,8 +1118,8 @@ mod platform {
             assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYUP));
 
             assert_eq!(
-                edge_names(drain(&rx)),
-                vec!["pressed", "released"]
+                drain(&rx),
+                vec![HotkeyEvent::Pressed, HotkeyEvent::Released]
             );
         }
 
@@ -1156,8 +1135,12 @@ mod platform {
             assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYDOWN));
 
             assert_eq!(
-                edge_names(drain(&rx)),
-                vec!["pressed", "released", "pressed"]
+                drain(&rx),
+                vec![
+                    HotkeyEvent::Pressed,
+                    HotkeyEvent::Released,
+                    HotkeyEvent::Pressed
+                ]
             );
         }
 
@@ -1196,8 +1179,8 @@ mod platform {
             assert!(dispatch_keyboard_event(&left_ctx, VK_LMENU, WM_KEYDOWN));
             assert!(dispatch_keyboard_event(&left_ctx, VK_LMENU, WM_KEYUP));
             assert_eq!(
-                edge_names(drain(&left_rx)),
-                vec!["pressed", "released"]
+                drain(&left_rx),
+                vec![HotkeyEvent::Pressed, HotkeyEvent::Released]
             );
 
             let right_option_shared = shared(HotkeyTrigger::RightOption);
@@ -1212,7 +1195,7 @@ mod platform {
                 VK_RMENU,
                 WM_KEYDOWN
             ));
-            assert_eq!(edge_names(drain(&right_option_rx)), vec!["pressed"]);
+            assert_eq!(drain(&right_option_rx), vec![HotkeyEvent::Pressed]);
 
             let right_alt_shared = shared(HotkeyTrigger::RightAlt);
             let (right_alt_ctx, right_alt_rx) = callback_context(right_alt_shared);
@@ -1226,7 +1209,7 @@ mod platform {
                 VK_RMENU,
                 WM_KEYDOWN
             ));
-            assert_eq!(edge_names(drain(&right_alt_rx)), vec!["pressed"]);
+            assert_eq!(drain(&right_alt_rx), vec![HotkeyEvent::Pressed]);
         }
 
         #[test]
@@ -1248,12 +1231,10 @@ mod platform {
             dispatch_keyboard_event(&ctx, VK_LSHIFT, WM_KEYDOWN);
             dispatch_keyboard_event(&ctx, 0x44, WM_KEYDOWN);
 
-            assert!(matches!(combo_rx.recv().unwrap(), ComboHotkeyEvent::Pressed { .. }));
-            assert!(
-                hotkey_rx
-                    .try_iter()
-                    .any(|evt| evt == HotkeyEvent::TranslationModifierPressed)
-            );
+            assert_eq!(combo_rx.recv().unwrap(), ComboHotkeyEvent::Pressed);
+            assert!(hotkey_rx
+                .try_iter()
+                .any(|evt| evt == HotkeyEvent::TranslationModifierPressed));
 
             drop(monitor);
         }

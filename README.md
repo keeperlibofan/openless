@@ -5,7 +5,7 @@
 <h1 align="center">OpenLess</h1>
 
 <p align="center">
-  <strong>Open-source voice input for macOS &amp; Windows</strong>
+  <strong>Open-source voice input for macOS, Windows, and this fork's Linux/X11 setup</strong>
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://openless.top"><strong>Website</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/appergb/openless/releases/latest"><strong>Download</strong></a>
+  <a href="https://github.com/Open-Less/openless/releases/latest"><strong>Official releases</strong></a>
   &nbsp;·&nbsp;
   <a href="README.md">English</a>
   &nbsp;/&nbsp;
@@ -24,9 +24,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/appergb/openless/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/appergb/openless?style=flat-square&color=2c5282" /></a>
-  <a href="https://github.com/appergb/openless/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/appergb/openless?style=flat-square&color=2f855a" /></a>
-  <a href="https://github.com/appergb/openless/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/appergb/openless?style=flat-square&color=805ad5" /></a>
+  <a href="https://github.com/Open-Less/openless/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Open-Less/openless?style=flat-square&color=2c5282" /></a>
+  <a href="https://github.com/Open-Less/openless/blob/beta/LICENSE"><img alt="License" src="https://img.shields.io/github/license/Open-Less/openless?style=flat-square&color=2f855a" /></a>
+  <a href="https://github.com/keeperlibofan/openless"><img alt="Personal fork" src="https://img.shields.io/badge/fork-keeperlibofan%2Fopenless-805ad5?style=flat-square&logo=github" /></a>
   <a href="https://discord.gg/vTZHTFGFm"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
 </p>
 
@@ -42,6 +42,14 @@
 </p>
 
 <br/>
+
+> [!IMPORTANT]
+> This repository is a personal fork based on the official MIT-licensed
+> [Open-Less/openless](https://github.com/Open-Less/openless) project. The
+> `codex/linux-continuous-dictation` branch preserves the exact Linux/X11 build
+> used by `keeperlibofan`, including Fcitx 4/Sogou support, ordered concurrent
+> dictation processing, cursor insertion, and the draggable status overlay.
+> See [linux/README.md](linux/README.md) for installation and recovery.
 
 <h2 align="center">Sponsors</h2>
 

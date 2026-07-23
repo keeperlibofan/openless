@@ -4,13 +4,7 @@ import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ShortcutRecorder } from '../../components/ShortcutRecorder';
-import {
-  defaultLessComputerShortcut,
-  defaultOpenAppShortcut,
-  defaultQaShortcut,
-  defaultSwitchStyleShortcut,
-  hotkeyModeSuffix,
-} from '../../lib/hotkey';
+import { defaultLessComputerShortcut, defaultOpenAppShortcut, defaultQaShortcut, defaultSwitchStyleShortcut } from '../../lib/hotkey';
 import {
   setDictationHotkey,
   setOpenAppHotkey,
@@ -62,9 +56,7 @@ export function ShortcutsSection() {
 
   const readonlyRows: Array<[string, string]> = [
     [t('settings.shortcuts.cancel'), 'Esc'],
-    // 胶囊右侧「✓ 确认插入」目前只在 macOS 胶囊上有，Windows/Linux 胶囊没有这个按钮，
-    // 之前 os !== 'linux' 把它也展示给了 Windows，误导用户以为有个用不了的快捷键（issue #780）。
-    ...(os === 'mac' ? [[t('settings.shortcuts.confirm'), t('settings.shortcuts.confirmHint')]] as Array<[string, string]> : []),
+    ...(os !== 'linux' ? [[t('settings.shortcuts.confirm'), t('settings.shortcuts.confirmHint')]] as Array<[string, string]> : []),
   ];
   return (
     <Card>
@@ -82,7 +74,7 @@ export function ShortcutsSection() {
             }}
           />
           <div style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>
-            {hotkeyModeSuffix(hotkey.mode)}
+            {hotkey.mode === 'hold' ? t('hotkey.modeHoldSuffix') : t('hotkey.modeToggleSuffix')}
           </div>
         </div>
       </SettingRow>

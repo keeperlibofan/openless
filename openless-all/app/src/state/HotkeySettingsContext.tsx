@@ -59,7 +59,6 @@ export function HotkeySettingsProvider({ children }: { children: ReactNode }) {
             ])
             let nextError: string | null = null
             if (prefsResult.status === "fulfilled") {
-                latestPrefsRef.current = prefsResult.value
                 setPrefs(prefsResult.value)
                 applyThemeFromPreference(prefsResult.value.themeMode ?? "system")
             } else {
@@ -149,6 +148,16 @@ export function HotkeySettingsProvider({ children }: { children: ReactNode }) {
     useEffect(() => {
         const currentPrefs = latestPrefsRef.current
         if (!currentPrefs) return
+        // Auto/auto is a valid user preference: let the LLM follow the spoken
+        // language instead of forcing output to the WebView UI locale on every
+        // startup. Explicit language changes still persist their locale-derived
+        // output preferences through LanguageSection.
+        if (
+            currentPrefs.chineseScriptPreference === "auto" &&
+            currentPrefs.outputLanguagePreference === "auto"
+        ) {
+            return
+        }
         const lang = (
             i18n.resolvedLanguage ||
             i18n.language ||

@@ -1,9 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::coordinator_state::{
-    finish_cancelled_processing_state, request_stop_during_starting_state,
-};
+use crate::coordinator_state::request_stop_during_starting_state;
 use crate::correction::apply_correction_rules;
 use crate::types::HotkeyMode;
 
@@ -14,11 +12,6 @@ use super::*;
 /// 同一个 hotkey 边沿之间的最小间隔。低于此阈值的连按整体作为误触丢弃 ——
 /// 避免微动开关回弹 / 用户手抖双击造成的空转写报错和 ASR session 抢资源。
 const HOTKEY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
-/// Auto 模式下区分「短按 = 切换式」与「长按 = 按住说话」的按住时长阈值。
-/// 松手时若按住 < 此值判为短按（锁存，保持录音），>= 此值判为长按（松手即停）。
-/// 时长以热键事件产生时携带的时间戳计算，避免串行 bridge 的排队延迟改变用户的物理按住时长。
-/// 350ms 是「点一下 vs 明显按住」的自然分界。
-const AUTO_HOLD_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(350);
 const STREAMING_INSERT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
 
 #[cfg(target_os = "macos")]
@@ -67,9 +60,9 @@ pub(super) fn resolve_less_computer_approval(token: &str, approved: bool) {
         .and_then(|mut m| m.remove(token));
     if let Some(tx) = sender {
         let _ = tx.send(approved);
-        log::info!("[less-computer] 审批已解析 approved={approved}");
+        log::info!("[less-computer] 审批 token={token} approved={approved}");
     } else {
-        log::info!("[less-computer] 审批请求已失效（超时/重复）");
+        log::info!("[less-computer] 审批 token={token} 已失效（超时/重复）");
     }
 }
 
@@ -181,34 +174,6 @@ mod less_computer_event_log_tests {
     }
 }
 
-#[cfg(test)]
-mod less_computer_approval_log_tests {
-    #[test]
-    fn approval_capability_is_never_interpolated_into_logs() {
-        let sources = [
-            include_str!("dictation.rs"),
-            include_str!("hotkey_loops.rs"),
-            include_str!("../coordinator.rs"),
-            include_str!("../commands/qa.rs"),
-            include_str!("../lib.rs"),
-        ];
-
-        for source in sources {
-            for statement in source.split("log::").skip(1) {
-                let statement = statement
-                    .split_once(");")
-                    .map_or(statement, |(head, _)| head);
-                if statement.contains("[less-computer]") {
-                    assert!(
-                        !statement.contains("token"),
-                        "Less Computer approval logs must not contain the capability token: {statement}"
-                    );
-                }
-            }
-        }
-    }
-}
-
 /// 跑流式润色路径（opt-in，跨平台）。
 ///
 /// 平台差异：
@@ -248,6 +213,7 @@ async fn run_streaming_polish(
     llm_thinking_enabled: bool,
     front_app: Option<&str>,
     prior_turns: &[(String, String)],
+    processing_cancelled: Arc<AtomicBool>,
 ) -> (String, Option<String>, bool) {
     log::info!(
         "[coord] streaming_insert path ENTER (raw_chars={})",
@@ -310,8 +276,7 @@ async fn run_streaming_polish(
     // from what the user actually sees\"。
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     #[cfg(target_os = "windows")]
-    let sendinput_options =
-        windows_sendinput_options_from_prefs(&inner.prefs.get());
+    let sendinput_options = windows_sendinput_options_from_prefs(&inner.prefs.get());
     let typer_handle = tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "windows")]
         {
@@ -328,8 +293,7 @@ async fn run_streaming_polish(
     });
 
     // 3. 调流式润色，on_delta 塞 mpsc；should_cancel 检查 dictation 取消旗。
-    let inner_for_cancel = Arc::clone(inner);
-    let should_cancel = move || inner_for_cancel.state.lock().cancelled;
+    let should_cancel = move || processing_cancelled.load(Ordering::SeqCst);
     // Simplified 目标：对每个 delta 就地 t2s（转换器建一次，避免每个 delta 重新加载
     // 词典）。Traditional 不会走到这里（eligibility 已降级），Auto 无需转换。
     let delta_converter = (chinese_script_preference
@@ -702,7 +666,7 @@ fn default_done_message(status: InsertStatus, polish_failed: bool) -> Option<Str
     }
 }
 
-pub(super) async fn handle_pressed_edge(inner: &Arc<Inner>, pressed_at: std::time::Instant) {
+pub(super) async fn handle_pressed_edge(inner: &Arc<Inner>) {
     let was_held = inner.hotkey_trigger_held.swap(true, Ordering::SeqCst);
     if !was_held {
         // 防抖：相邻 < HOTKEY_DEBOUNCE 的边沿直接丢弃，记到 log 方便排查。
@@ -736,7 +700,7 @@ pub(super) async fn handle_pressed_edge(inner: &Arc<Inner>, pressed_at: std::tim
         if panel_visible && !dictation_active {
             handle_qa_option_edge(inner).await;
         } else {
-            handle_pressed(inner, pressed_at).await;
+            handle_pressed(inner).await;
         }
     }
 }
@@ -761,7 +725,7 @@ fn is_queued_chain_press(now: std::time::Instant, cooldown_until: std::time::Ins
         .unwrap_or(false)
 }
 
-pub(super) async fn handle_pressed(inner: &Arc<Inner>, pressed_at: std::time::Instant) {
+pub(super) async fn handle_pressed(inner: &Arc<Inner>) {
     let mode = inner.prefs.get().hotkey.mode;
     let phase = inner.state.lock().phase;
     log::info!("[coord] hotkey pressed (mode={mode:?}, phase={phase:?})");
@@ -800,42 +764,11 @@ pub(super) async fn handle_pressed(inner: &Arc<Inner>, pressed_at: std::time::In
         (HotkeyMode::Toggle, SessionPhase::Starting) => {
             request_stop_during_starting(inner, "toggle stop edge");
         }
-        // Auto 模式：按下即开录（与 Hold 一样不丢首字）。是短按还是长按要到松手时才知道，
-        // 所以这里只负责「开始」并记下按下时刻，语义交给 handle_released 判定。
-        (HotkeyMode::Auto, SessionPhase::Idle) => {
-            // 复用 Toggle 的冷却 / 排队接力检查：#545 离场动画期间误触保护。
-            let now = std::time::Instant::now();
-            let cooldown_until = *inner.session_cooldown_until.lock();
-            if let Some(deadline) = cooldown_until {
-                if now < deadline {
-                    if is_queued_chain_press(now, deadline) {
-                        log::info!(
-                            "[coord] queued-chain activation (auto): 识别中按下，会话收尾后接力开录下一条"
-                        );
-                    } else {
-                        log::info!(
-                            "[coord] auto activation blocked by cooldown (session still winding down)"
-                        );
-                        return;
-                    }
-                }
-            }
-            *inner.hotkey_press_at.lock() = Some(pressed_at);
-            let _ = begin_session(inner).await;
-        }
-        // Auto 模式已因上一次「短按」锁存为切换态，再次按下 → 用户想停。
-        (HotkeyMode::Auto, SessionPhase::Listening) => {
-            let _ = end_session(inner).await;
-        }
-        // Auto 模式锁存后仍在 Starting 时第二次按 → 想停，同 Toggle 存边沿。
-        (HotkeyMode::Auto, SessionPhase::Starting) => {
-            request_stop_during_starting(inner, "auto stop edge");
-        }
         _ => {}
     }
 }
 
-pub(super) async fn handle_released_edge(inner: &Arc<Inner>, released_at: std::time::Instant) {
+pub(super) async fn handle_released_edge(inner: &Arc<Inner>) {
     let was_held = inner.hotkey_trigger_held.swap(false, Ordering::SeqCst);
     if was_held {
         // QA 浮窗可见时，Option 行为是 press-toggle（不分 hold/release），release 边沿忽略。
@@ -847,11 +780,11 @@ pub(super) async fn handle_released_edge(inner: &Arc<Inner>, released_at: std::t
         if panel_visible && !dictation_active {
             return;
         }
-        handle_released(inner, released_at).await;
+        handle_released(inner).await;
     }
 }
 
-pub(super) async fn handle_released(inner: &Arc<Inner>, released_at: std::time::Instant) {
+pub(super) async fn handle_released(inner: &Arc<Inner>) {
     let mode = inner.prefs.get().hotkey.mode;
     let phase = inner.state.lock().phase;
     log::info!("[coord] hotkey released (mode={mode:?}, phase={phase:?})");
@@ -867,28 +800,6 @@ pub(super) async fn handle_released(inner: &Arc<Inner>, released_at: std::time::
             // Hold 模式 Starting 阶段松开 → 用户想停。同上：握手完成后再 end。
             SessionPhase::Starting => {
                 request_stop_during_starting(inner, "hold release edge");
-            }
-            _ => {}
-        }
-    }
-    if mode == HotkeyMode::Auto {
-        // 使用物理按下/松开的事件时刻，避免 bridge 排队时把处理延迟误算为按住时长。
-        let held_long = inner.hotkey_press_at.lock().take()
-            .map(|pressed_at| released_at.saturating_duration_since(pressed_at) >= AUTO_HOLD_THRESHOLD)
-            .unwrap_or(false);
-        match phase {
-            // 长按松手 = 按住说话，松手即停；短按 = 切换式，锁存保持录音，下次按下再停。
-            SessionPhase::Listening if held_long => {
-                let _ = end_session(inner).await;
-            }
-            // 仍在握手就松手，且判为长按 → 用户按住说话想停，存边沿握手完成后再 end。
-            SessionPhase::Starting if held_long => {
-                request_stop_during_starting(inner, "auto hold release edge");
-            }
-            SessionPhase::Listening | SessionPhase::Starting => {
-                log::info!(
-                    "[coord] auto short-tap latched (toggle semantics); next press stops"
-                );
             }
             _ => {}
         }
@@ -996,11 +907,6 @@ pub(super) async fn run_voice_agent_transcript(
         None => outcome,
     };
 
-    {
-        let mut state = inner.state.lock();
-        state.phase = SessionPhase::Idle;
-        state.focus_target = None; // 清除过期焦点目标，避免影响下次会话
-    }
     // 工作结束：熄灭全屏彩虹描边（聊天浮窗保留，等用户读完/关闭）。
     if let Some(app) = inner.app.lock().clone() {
         crate::hide_less_computer_glow(&app);
@@ -1049,7 +955,7 @@ pub(super) async fn run_voice_agent_transcript(
             log::info!("[coord] Cloud Agent 语音已取消");
             emit_less_computer(inner, serde_json::json!({ "kind": "cancelled" }));
             emit_capsule(inner, CapsuleState::Cancelled, 0.0, elapsed, None, None);
-            schedule_capsule_idle(inner, CAPSULE_CANCEL_HIDE_DELAY_MS);
+            schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
             Err("voice agent cancelled".to_string())
         }
     }
@@ -1186,8 +1092,7 @@ async fn run_less_computer_once(
             // OpenCode 无 `--settings`，护栏走 `permission` 配置经 OPENCODE_CONFIG_CONTENT 注入。
             // build_opencode_guard_config 默认 bash deny 高风险前缀、webfetch deny，审批放行的
             // 前缀显式 allow。fail-closed：序列化失败立即中止，绝不无护栏裸跑。
-            let guard =
-                crate::coding_agent::guard::build_opencode_guard_config(&approved_patterns);
+            let guard = crate::coding_agent::guard::build_opencode_guard_config(&approved_patterns);
             let guard_str = match serde_json::to_string(&guard) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1392,10 +1297,7 @@ pub(super) async fn begin_session(inner: &Arc<Inner>) -> Result<(), String> {
 
 /// begin_session 的带参版本，voice_agent=true 时在 Starting 阶段就标记好，
 /// 防止 finish_starting_session 处理 pending_stop 时丢失标志。
-pub(super) async fn begin_session_as(
-    inner: &Arc<Inner>,
-    voice_agent: bool,
-) -> Result<(), String> {
+pub(super) async fn begin_session_as(inner: &Arc<Inner>, voice_agent: bool) -> Result<(), String> {
     let current_session_id = {
         let mut state = inner.state.lock();
         let Some(session_id) =
@@ -1456,28 +1358,6 @@ pub(super) async fn begin_session_as(
     }
 
     let active_asr = CredentialsVault::get_active_asr();
-    let asr_model = CredentialsVault::get(CredentialAccount::AsrModel)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let effective_asr = match resolve_effective_asr_provider(&active_asr, &asr_model) {
-        Ok(provider) => provider,
-        Err(message) => {
-            log::warn!("[coord] ASR model routing rejected: {message}");
-            emit_capsule(
-                inner,
-                CapsuleState::Error,
-                0.0,
-                0,
-                Some(message.clone()),
-                None,
-            );
-            restore_prepared_windows_ime_session(inner, current_session_id);
-            inner.state.lock().phase = SessionPhase::Idle;
-            schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
-            return Err(message);
-        }
-    };
 
     if let Err(message) = ensure_microphone_permission(inner) {
         log::warn!("[coord] microphone permission gate failed: {message}");
@@ -1647,24 +1527,7 @@ pub(super) async fn begin_session_as(
         return Ok(());
     }
 
-    // 统一百炼:按所选模型把 build 分发重定向到具体协议 id（凭据仍读真实 active
-    // `bailian` 的那把 key；endpoint 由前端按模型同步）。别名 id 原样返回,走旧路径。
-    // 编译期护栏（exhaustiveness tripwire）：下面这条云端构建 if-else 链最后是
-    // `else` 静默落到火山。这个穷尽的空 match 本身不做事，但新增
-    // ActiveAsrProviderKind 时会在此编译失败，逼作者回来给新 kind 补一条构建分支
-    // ——把「装完才发现漏了」的运行期坑变成编译期错误。QA 侧的 build_qa_asr_start
-    // 已是穷尽 match，两条构建路径都受编译器保护。
-    match active_asr_provider_kind(&effective_asr) {
-        ActiveAsrProviderKind::Bailian
-        | ActiveAsrProviderKind::Qwen3Realtime
-        | ActiveAsrProviderKind::Mimo
-        | ActiveAsrProviderKind::DashScopeMultimodal
-        | ActiveAsrProviderKind::ElevenLabs
-        | ActiveAsrProviderKind::WhisperCompatible
-        | ActiveAsrProviderKind::Volcengine => {}
-    }
-
-    if is_bailian_provider(&effective_asr) {
+    if is_bailian_provider(&active_asr) {
         let asr = Arc::new(BailianRealtimeASR::new(read_bailian_credentials()));
         let bridge = Arc::new(DeferredAsrBridge::new());
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = bridge.clone();
@@ -1736,84 +1599,7 @@ pub(super) async fn begin_session_as(
         let flushed_bytes = bridge.attach(target);
         log::info!("[coord] Bailian ASR connected; flushed {flushed_bytes} deferred audio bytes");
         finish_starting_session(inner, current_session_id).await;
-    } else if is_qwen3_realtime_provider(&effective_asr) {
-        // 与 Bailian 分支同构：流式 WS 会话 + DeferredAsrBridge 缓冲开链前音频。
-        let asr = Arc::new(Qwen3RealtimeASR::new(read_qwen3_realtime_credentials()));
-        let bridge = Arc::new(DeferredAsrBridge::new());
-        let consumer: Arc<dyn crate::recorder::AudioConsumer> = bridge.clone();
-        store_asr_for_session(
-            inner,
-            current_session_id,
-            ActiveAsr::Qwen3Realtime(Arc::clone(&asr)),
-        );
-        start_recorder_for_starting(inner, current_session_id, &active_asr, consumer).await?;
-
-        if let Err(e) = asr.open_session().await {
-            log::error!("[coord] open Qwen3 realtime ASR session failed: {e}");
-            match startup_race_status_for_starting(inner, current_session_id) {
-                StartupRaceStatus::StaleContinuation => {
-                    log::info!(
-                        "[coord] stale Qwen3 realtime ASR open_session error from session {current_session_id} — ignoring"
-                    );
-                    asr.cancel();
-                    discard_startup_resources_for_session(inner, current_session_id);
-                    restore_prepared_windows_ime_session(inner, current_session_id);
-                    return Ok(());
-                }
-                StartupRaceStatus::CancelRaced => {
-                    asr.cancel();
-                    discard_startup_resources_for_session(inner, current_session_id);
-                    restore_prepared_windows_ime_session(inner, current_session_id);
-                    set_phase_idle_if_session_matches(inner, current_session_id);
-                    return Ok(());
-                }
-                StartupRaceStatus::ActiveStarting => {
-                    asr.cancel();
-                }
-            }
-            discard_startup_resources_for_session(inner, current_session_id);
-            emit_capsule(
-                inner,
-                CapsuleState::Error,
-                0.0,
-                0,
-                Some(format!("ASR 连接失败: {e}")),
-                None,
-            );
-            restore_prepared_windows_ime_session(inner, current_session_id);
-            set_phase_idle_if_session_matches(inner, current_session_id);
-            schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
-            return Err(e.to_string());
-        }
-        match startup_race_status_for_starting(inner, current_session_id) {
-            StartupRaceStatus::ActiveStarting => {}
-            StartupRaceStatus::CancelRaced => {
-                log::info!(
-                    "[coord] cancel raced during Qwen3 realtime ASR open_session — aborting begin"
-                );
-                asr.cancel();
-                discard_startup_resources_for_session(inner, current_session_id);
-                restore_prepared_windows_ime_session(inner, current_session_id);
-                set_phase_idle_if_session_matches(inner, current_session_id);
-                return Ok(());
-            }
-            StartupRaceStatus::StaleContinuation => {
-                log::info!(
-                    "[coord] stale Qwen3 realtime ASR open_session continuation from session {current_session_id} — ignoring"
-                );
-                asr.cancel();
-                discard_startup_resources_for_session(inner, current_session_id);
-                restore_prepared_windows_ime_session(inner, current_session_id);
-                return Ok(());
-            }
-        }
-        let target: Arc<dyn crate::asr::AudioConsumer> = asr;
-        let flushed_bytes = bridge.attach(target);
-        log::info!(
-            "[coord] Qwen3 realtime ASR connected; flushed {flushed_bytes} deferred audio bytes"
-        );
-        finish_starting_session(inner, current_session_id).await;
-    } else if is_mimo_provider(&effective_asr) {
+    } else if is_mimo_provider(&active_asr) {
         let (api_key, base_url, model) = read_mimo_credentials();
         let mimo = Arc::new(MimoBatchASR::new(api_key, base_url, model));
         store_asr_for_session(
@@ -1824,29 +1610,7 @@ pub(super) async fn begin_session_as(
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = mimo;
         start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
             .await?;
-    } else if is_dashscope_multimodal_provider(&effective_asr) {
-        let (api_key, base_url, model) = read_dashscope_multimodal_credentials();
-        let asr = Arc::new(DashScopeMultimodalASR::new(api_key, base_url, model));
-        store_asr_for_session(
-            inner,
-            current_session_id,
-            ActiveAsr::DashScopeMultimodal(Arc::clone(&asr)),
-        );
-        let consumer: Arc<dyn crate::recorder::AudioConsumer> = asr;
-        start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
-            .await?;
-    } else if is_elevenlabs_provider(&effective_asr) {
-        let (api_key, base_url, model) = read_elevenlabs_credentials();
-        let asr = Arc::new(ElevenLabsBatchASR::new(api_key, base_url, model));
-        store_asr_for_session(
-            inner,
-            current_session_id,
-            ActiveAsr::ElevenLabs(Arc::clone(&asr)),
-        );
-        let consumer: Arc<dyn crate::recorder::AudioConsumer> = asr;
-        start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
-            .await?;
-    } else if is_whisper_compatible_provider(&effective_asr) {
+    } else if is_whisper_compatible_provider(&active_asr) {
         let (api_key, base_url, model) = read_whisper_credentials();
         // 用户辞書の有効フレーズを Whisper の `prompt` に流し込む。固有名詞や
         // 専門用語の同音・近形誤認識を ASR 段階で抑える。Polish LLM 側には
@@ -1992,7 +1756,9 @@ pub(super) async fn start_recorder_for_starting(
         // 第一帧 PCM 真的流到 consumer 了（recorder.rs::process_callback 的顺序保证
         // consume_pcm_chunk 先于 level_handler）——关掉预备态，让这一帧起 payload.warming
         // 翻 false，前端把「待命」光条点亮成正式录音态。之后每帧都是 false（幂等）。
-        inner_for_level.capsule_warming.store(false, Ordering::SeqCst);
+        inner_for_level
+            .capsule_warming
+            .store(false, Ordering::SeqCst);
         emit_capsule(
             &inner_for_level,
             CapsuleState::Recording,
@@ -2207,13 +1973,18 @@ fn build_transcribe_failed_session(
     }
 }
 
-fn write_transcribe_failed_history(inner: &Arc<Inner>, session_id: SessionId, duration_ms: u64) {
+fn write_transcribe_failed_history(
+    inner: &Arc<Inner>,
+    session_id: SessionId,
+    duration_ms: u64,
+    has_audio_recording: bool,
+) {
     let prefs = inner.prefs.get();
     let session = build_transcribe_failed_session(
         session_id,
         duration_ms,
         prefs.default_mode,
-        inner.audio_archive_active.load(Ordering::Relaxed),
+        has_audio_recording,
     );
     if let Err(e) = inner.history.append_with_retention(
         session,
@@ -2232,13 +2003,13 @@ fn fail_dictation(
     inner: &Arc<Inner>,
     session_id: SessionId,
     elapsed: u64,
+    has_audio_recording: bool,
     user_msg: String,
     err: String,
 ) -> Result<(), String> {
-    write_transcribe_failed_history(inner, session_id, elapsed);
-    emit_capsule(inner, CapsuleState::Error, 0.0, elapsed, Some(user_msg), None);
+    write_transcribe_failed_history(inner, session_id, elapsed, has_audio_recording);
+    emit_processing_capsule(inner, CapsuleState::Error, elapsed, Some(user_msg), None);
     restore_prepared_windows_ime_session(inner, session_id);
-    inner.state.lock().phase = SessionPhase::Idle;
     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
     Err(err)
 }
@@ -2263,12 +2034,6 @@ const SILENT_RETRY_MAX: u32 = 2;
 /// 网络/服务端一点缓冲再打。
 const SILENT_RETRY_BACKOFF_MS: u64 = 500;
 
-enum SilentRetryOutcome {
-    Transcript(RawTranscript),
-    Exhausted,
-    Cancelled,
-}
-
 /// 归档 wav 是 16k/mono/16-bit、固定 44 字节标准头（asr::wav::encode_wav_16k_mono）；取出
 /// PCM 负载。长度 <= 44（空/损坏）返回 None。
 fn pcm_from_wav_bytes(wav: &[u8]) -> Option<Vec<u8>> {
@@ -2291,142 +2056,124 @@ async fn retranscribe_pcm_via_inner(inner: &Arc<Inner>, pcm: Vec<u8>) -> Result<
     Coordinator {
         inner: Arc::clone(inner),
     }
-    .retranscribe_pcm_until_cancelled(pcm)
+    .retranscribe_pcm(pcm)
     .await
 }
 
 /// 自动静默重试：从刚归档的 wav 读 PCM，用当前 provider 重转最多 SILENT_RETRY_MAX 次（线性
-/// 退避）。任一次拿到非空文本立即返回 Transcript（当作正常转写继续走润色/插入）；没有归档
-/// 音频、读不到或全部失败返回 Exhausted（交回 fail_dictation 做「失败保留 + 报错」）。如果
-/// 用户在退避或重试请求期间按 Esc，则返回 Cancelled，直接完成取消收尾。全程不改胶囊文案——
-/// 对用户静默，只是「转写中」多停留一会儿。
-async fn try_silent_retranscribe(inner: &Arc<Inner>, session_id: SessionId) -> SilentRetryOutcome {
-    if inner.state.lock().cancelled {
-        return SilentRetryOutcome::Cancelled;
+/// 退避）。任一次拿到非空文本立即 Some（当作正常转写继续走润色/插入）；没有归档音频、读不到、
+/// 或全部失败则 None（交回 fail_dictation 做「失败保留 + 报错」）。全程不改胶囊文案——对用户
+/// 静默，只是「转写中」多停留一会儿。
+async fn try_silent_retranscribe(
+    inner: &Arc<Inner>,
+    session_id: SessionId,
+    has_audio_recording: bool,
+) -> Option<RawTranscript> {
+    if !has_audio_recording {
+        return None; // 没归档音频，无从重试
     }
-    if !inner.audio_archive_active.load(Ordering::Relaxed) {
-        return SilentRetryOutcome::Exhausted; // 没归档音频，无从重试
-    }
-    let Some(path) = crate::persistence::recording_path_for_session(&session_id.to_string()).ok()
-    else {
-        return SilentRetryOutcome::Exhausted;
-    };
-    let wav = tokio::select! {
-        biased;
-        _ = wait_for_processing_cancel(inner) => return SilentRetryOutcome::Cancelled,
-        result = tokio::fs::read(&path) => match result {
-            Ok(wav) => wav,
-            Err(_) => return SilentRetryOutcome::Exhausted,
-        },
-    };
-    let Some(pcm) = pcm_from_wav_bytes(&wav) else {
-        return SilentRetryOutcome::Exhausted;
-    };
+    let path = crate::persistence::recording_path_for_session(&session_id.to_string()).ok()?;
+    let wav = tokio::fs::read(&path).await.ok()?;
+    let pcm = pcm_from_wav_bytes(&wav)?;
     let duration_ms = pcm_duration_ms(pcm.len());
     for attempt in 1..=SILENT_RETRY_MAX {
-        tokio::select! {
-            biased;
-            _ = wait_for_processing_cancel(inner) => return SilentRetryOutcome::Cancelled,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(
-                SILENT_RETRY_BACKOFF_MS * attempt as u64,
-            )) => {}
-        }
-        let result = tokio::select! {
-            biased;
-            _ = wait_for_processing_cancel(inner) => return SilentRetryOutcome::Cancelled,
-            result = retranscribe_pcm_via_inner(inner, pcm.clone()) => result,
-        };
-        match result {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            SILENT_RETRY_BACKOFF_MS * attempt as u64,
+        ))
+        .await;
+        match retranscribe_pcm_via_inner(inner, pcm.clone()).await {
             Ok(text) if !text.trim().is_empty() => {
                 log::info!(
                     "[coord] 自动静默重试第 {attempt}/{SILENT_RETRY_MAX} 次成功（{} 字）",
                     text.chars().count()
                 );
-                return SilentRetryOutcome::Transcript(RawTranscript { text, duration_ms });
+                return Some(RawTranscript { text, duration_ms });
             }
             Ok(_) => {
                 // 重试得到空转写——多半真没说话，再重试无意义，省流量直接放弃。
                 log::info!("[coord] 自动静默重试得到空转写，停止重试");
-                return SilentRetryOutcome::Exhausted;
+                return None;
             }
             Err(e) => {
                 log::warn!("[coord] 自动静默重试第 {attempt}/{SILENT_RETRY_MAX} 次失败: {e}");
             }
         }
     }
-    SilentRetryOutcome::Exhausted
+    None
 }
 
-fn finish_cancelled_processing(inner: &Arc<Inner>, session_id: SessionId) -> bool {
-    let finished = {
-        let mut state = inner.state.lock();
-        finish_cancelled_processing_state(&mut state, session_id)
-    };
-    if finished {
-        schedule_capsule_idle(inner, CAPSULE_CANCEL_HIDE_DELAY_MS);
-    }
-    finished
+fn capture_lane_active(inner: &Arc<Inner>) -> bool {
+    matches!(
+        inner.state.lock().phase,
+        SessionPhase::Starting | SessionPhase::Listening
+    )
 }
 
-pub(super) fn schedule_cancelled_asr_release(
+fn emit_processing_capsule(
     inner: &Arc<Inner>,
-    asr: &ActiveAsr,
-    session_id: SessionId,
+    state: CapsuleState,
+    elapsed: u64,
+    message: Option<String>,
+    inserted_chars: Option<u32>,
 ) {
-    match asr {
-        #[cfg(target_os = "windows")]
-        ActiveAsr::FoundryLocalWhisper(_) => {
-            schedule_foundry_local_asr_release(inner, AsrReleaseSession::Dictation(session_id));
-        }
-        #[cfg(target_os = "windows")]
-        ActiveAsr::SherpaOnnxLocal(_) => {
-            schedule_sherpa_onnx_release(inner, AsrReleaseSession::Dictation(session_id));
-        }
-        #[cfg(target_os = "macos")]
-        ActiveAsr::Local(_) => {
-            inner.local_asr_cache.touch();
-            schedule_local_asr_release(inner);
-        }
-        _ => {}
+    if capture_lane_active(inner) && !matches!(state, CapsuleState::Done) {
+        log::info!(
+            "[coord] background {:?} capsule suppressed while a newer recording is active",
+            state
+        );
+        return;
+    }
+    emit_capsule(inner, state, 0.0, elapsed, message, inserted_chars);
+}
+
+fn enqueue_processing_job(inner: &Arc<Inner>, job: PendingDictation) {
+    let session_id = job.capture.session_id;
+    let (start_worker, pending) = {
+        let mut queue = inner.processing_queue.lock();
+        let start_worker = queue.enqueue(job);
+        (start_worker, queue.len())
+    };
+    log::info!("[coord] session {session_id} queued for ordered processing (pending={pending})");
+    if start_worker {
+        let inner = Arc::clone(inner);
+        async_runtime::spawn(async move {
+            process_processing_queue(inner).await;
+        });
     }
 }
 
-/// end_session 转写阶段与「用户取消」赛跑的结果。
-enum TranscribeRace {
-    Done(Result<RawTranscript, TranscribeFail>),
-    /// 用户在 Processing（转写）阶段按 Esc / 取消：drop 掉在途 transcribe future。
-    Cancelled,
-}
-
-/// 轮询 Processing 阶段的取消标志。用户在转写阶段按 Esc 时，cancel_session 只把
-/// `state.cancelled` 置 true —— 此刻 ASR 句柄已被 end_session 从 `inner.asr` 槽 take 走，
-/// cancel_session 走的 `cancel_asr_for_session` 是 no-op，够不到在途请求。end_session 用
-/// 本函数与在途 transcribe future 赛跑：命中即 drop future，从而中断 reqwest HTTP /
-/// 停止等待流式最终结果 / 停止本地转写。
-///
-/// 用 75ms 轮询而非 notify：转写通常 0.2–3s，几次定时器唤醒的开销可忽略，用户也感知不到
-/// 这点延迟；换来的是不依赖任何唤醒信号、没有「取消边沿在注册 waiter 之前触发就丢失」的
-/// 竞态，逻辑上更稳。
-async fn wait_for_processing_cancel(inner: &Arc<Inner>) {
+async fn process_processing_queue(inner: Arc<Inner>) {
     loop {
-        if inner.state.lock().cancelled {
+        let job = { inner.processing_queue.lock().pop_next() };
+        let Some(job) = job else {
+            log::info!("[coord] ordered processing queue drained");
             return;
+        };
+        let session_id = job.capture.session_id;
+        log::info!("[coord] ordered processing started for session {session_id}");
+        if let Err(error) = process_queued_session(&inner, job).await {
+            log::warn!("[coord] ordered processing failed for session {session_id}: {error}");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
     }
 }
 
 pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
-    let current_session_id = {
+    let capture = {
         let mut state = inner.state.lock();
-        let Some(session_id) = start_processing_if_listening(&mut state) else {
+        let Some(capture) = finish_capture_for_processing_state(&mut state) else {
             return Ok(());
         };
-        session_id
+        capture
     };
+    let current_session_id = capture.session_id;
 
-    let elapsed = inner.state.lock().started_at.elapsed().as_millis() as u64;
-    emit_capsule(inner, CapsuleState::Transcribing, 0.0, elapsed, None, None);
+    emit_processing_capsule(
+        inner,
+        CapsuleState::Transcribing,
+        capture.elapsed_ms,
+        None,
+        None,
+    );
 
     if let Some(rec) = take_recorder_for_session(inner, current_session_id) {
         rec.stop();
@@ -2438,402 +2185,319 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         Some(a) => a,
         None => {
             restore_prepared_windows_ime_session(inner, current_session_id);
-            if !finish_cancelled_processing(inner, current_session_id) {
-                set_phase_idle_if_session_matches(inner, current_session_id);
-            }
             return Ok(());
         }
     };
 
+    let job = PendingDictation {
+        capture,
+        asr,
+        translation_active: inner.translation_modifier_seen.load(Ordering::SeqCst),
+        has_audio_recording: inner.audio_archive_active.swap(false, Ordering::Relaxed),
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
+    enqueue_processing_job(inner, job);
+    Ok(())
+}
+
+async fn process_queued_session(inner: &Arc<Inner>, job: PendingDictation) -> Result<(), String> {
+    let PendingDictation {
+        capture,
+        asr,
+        translation_active: translation_modifier_seen,
+        mut has_audio_recording,
+        cancelled: processing_cancelled,
+    } = job;
+    let current_session_id = capture.session_id;
+    let elapsed = capture.elapsed_ms;
+    let focus_target = capture.focus_target;
+    let front_app = capture.front_app;
+    let voice_agent = capture.voice_agent;
+
+    emit_processing_capsule(inner, CapsuleState::Transcribing, elapsed, None, None);
+
     let uses_global_timeout = asr_transcribe_uses_global_timeout(&asr);
-    // ASR 句柄内部是 Arc，clone 只是 +1 引用。留一份给取消路径：transcribe future 会把
-    // `asr` move 进去，命中取消时那个 future 会被 drop（连同它持有的 Arc），我们再用这份
-    // clone 显式 cancel，促使流式 WebSocket 立刻关闭、不残留后台 worker。
-    let asr_for_cancel = asr.clone();
     // 每个引擎分支产出 Ok(RawTranscript) 或 Err(TranscribeFail)；失败/超时不再就地 return，
     // 而是把失败值交给 match 之后统一处理：先自动静默重试（从归档音频重转，应对网络/服务端
     // 瞬时抖动），重试拿回文本就当正常转写继续；彻底失败才 fail_dictation 保留录音 + 报错。
-    //
-    // 整段转写与「用户在 Processing 阶段取消」赛跑：命中取消就直接 drop 掉 transcribe future
-    // 中断在途请求，不再傻等它跑完（见 issue「转写中按 Esc 停不下来」）。
-    let raced: TranscribeRace = {
-        let transcribe_fut = async move {
-            let transcribe_outcome: Result<RawTranscript, TranscribeFail> = match asr {
-                ActiveAsr::Volcengine(asr) => {
-                    debug_assert!(uses_global_timeout);
-                    if let Err(e) = asr.send_last_frame().await {
-                        log::error!("[coord] send last frame failed: {e}");
-                    }
-                    // 添加全局超时保护：防止 await_final_result() 永远挂起
-                    let timeout_duration =
-                        std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-                    match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => {
-                            log::error!("[coord] await final failed: {e}");
-                            // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
-                            asr.cancel();
-                            Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
-                        }
-                        Err(_) => {
-                            // 全局超时：最后的防线
-                            log::error!(
-                                "[coord] 全局超时 {} 秒 - 强制恢复",
-                                COORDINATOR_GLOBAL_TIMEOUT_SECS
-                            );
-                            // 清理 ASR session，避免资源泄漏
-                            asr.cancel();
-                            Err(TranscribeFail::new(
-                                "识别超时".to_string(),
-                                "global timeout".to_string(),
-                            ))
-                        }
-                    }
+    let transcribe_outcome: Result<RawTranscript, TranscribeFail> = match asr {
+        ActiveAsr::Volcengine(asr) => {
+            debug_assert!(uses_global_timeout);
+            if let Err(e) = asr.send_last_frame().await {
+                log::error!("[coord] send last frame failed: {e}");
+            }
+            // 添加全局超时保护：防止 await_final_result() 永远挂起
+            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => {
+                    log::error!("[coord] await final failed: {e}");
+                    // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
+                    asr.cancel();
+                    Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
                 }
-                ActiveAsr::Whisper(w) => {
-                    debug_assert!(uses_global_timeout);
-                    // Whisper / OpenRouter 动态超时：音频越长、分片越多，给更多
-                    // HTTP round-trip 预算。公式见 `whisper_transcribe_timeout`。
-                    let audio_secs = (w.buffer_duration_ms() as f64) / 1000.0;
-                    let timeout_duration = whisper_transcribe_timeout(audio_secs);
-                    log::info!(
-                        "[coord] Whisper transcribe: audio={:.2}s timeout={}s",
-                        audio_secs,
-                        timeout_duration.as_secs()
+                Err(_) => {
+                    // 全局超时：最后的防线
+                    log::error!(
+                        "[coord] 全局超时 {} 秒 - 强制恢复",
+                        COORDINATOR_GLOBAL_TIMEOUT_SECS
                     );
-                    match tokio::time::timeout(timeout_duration, w.transcribe()).await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => {
-                            log::error!("[coord] whisper transcribe failed: {e}");
-                            Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "[coord] Whisper 动态超时 {}s（音频 {:.2}s）",
-                                timeout_duration.as_secs(),
-                                audio_secs
-                            );
-                            Err(TranscribeFail::new(
-                                "识别超时".to_string(),
-                                "whisper global timeout".to_string(),
-                            ))
-                        }
-                    }
+                    // 清理 ASR session，避免资源泄漏
+                    asr.cancel();
+                    Err(TranscribeFail::new(
+                        "识别超时".to_string(),
+                        "global timeout".to_string(),
+                    ))
                 }
-                ActiveAsr::Mimo(m) => {
-                    debug_assert!(uses_global_timeout);
-                    let timeout_duration =
-                        std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-                    match tokio::time::timeout(timeout_duration, m.transcribe()).await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => {
-                            log::error!("[coord] MiMo ASR transcribe failed: {e}");
-                            Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "[coord] MiMo ASR 全局超时 {} 秒",
-                                COORDINATOR_GLOBAL_TIMEOUT_SECS
-                            );
-                            Err(TranscribeFail::new(
-                                "识别超时".to_string(),
-                                "mimo global timeout".to_string(),
-                            ))
-                        }
-                    }
+            }
+        }
+        ActiveAsr::Whisper(w) => {
+            debug_assert!(uses_global_timeout);
+            // Whisper / OpenRouter 动态超时：音频越长、分片越多，给更多
+            // HTTP round-trip 预算。公式见 `whisper_transcribe_timeout`。
+            let audio_secs = (w.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = whisper_transcribe_timeout(audio_secs);
+            log::info!(
+                "[coord] Whisper transcribe: audio={:.2}s timeout={}s",
+                audio_secs,
+                timeout_duration.as_secs()
+            );
+            match tokio::time::timeout(timeout_duration, w.transcribe()).await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => {
+                    log::error!("[coord] whisper transcribe failed: {e}");
+                    Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
                 }
-                ActiveAsr::DashScopeMultimodal(m) => {
-                    debug_assert!(uses_global_timeout);
-                    let audio_secs = m.buffer_duration_ms() as f64 / 1000.0;
-                    let timeout_duration = whisper_transcribe_timeout(audio_secs);
-                    log::info!(
-                        "[coord] DashScope Fun-ASR-Flash dynamic timeout: {}s (audio {:.2}s)",
+                Err(_) => {
+                    log::error!(
+                        "[coord] Whisper 动态超时 {}s（音频 {:.2}s）",
                         timeout_duration.as_secs(),
                         audio_secs
                     );
-                    match tokio::time::timeout(timeout_duration, m.transcribe()).await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => {
-                            log::error!("[coord] DashScope Fun-ASR-Flash transcribe failed: {e}");
-                            Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "[coord] DashScope Fun-ASR-Flash dynamic timeout {}s (audio {:.2}s)",
-                                timeout_duration.as_secs(),
-                                audio_secs
-                            );
-                            Err(TranscribeFail::new(
-                                "识别超时".to_string(),
-                                "dashscope multimodal global timeout".to_string(),
-                            ))
-                        }
-                    }
+                    Err(TranscribeFail::new(
+                        "识别超时".to_string(),
+                        "whisper global timeout".to_string(),
+                    ))
                 }
-                ActiveAsr::ElevenLabs(e) => {
-                    debug_assert!(uses_global_timeout);
-                    let audio_secs = e.buffer_duration_ms() as f64 / 1000.0;
-                    let timeout_duration = crate::asr::elevenlabs::transcribe_timeout(audio_secs);
-                    log::info!(
-                        "[coord] ElevenLabs dynamic timeout: {}s (audio {:.2}s)",
+            }
+        }
+        ActiveAsr::Mimo(m) => {
+            debug_assert!(uses_global_timeout);
+            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            match tokio::time::timeout(timeout_duration, m.transcribe()).await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => {
+                    log::error!("[coord] MiMo ASR transcribe failed: {e}");
+                    Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
+                }
+                Err(_) => {
+                    log::error!(
+                        "[coord] MiMo ASR 全局超时 {} 秒",
+                        COORDINATOR_GLOBAL_TIMEOUT_SECS
+                    );
+                    Err(TranscribeFail::new(
+                        "识别超时".to_string(),
+                        "mimo global timeout".to_string(),
+                    ))
+                }
+            }
+        }
+        ActiveAsr::Bailian(asr) => {
+            debug_assert!(uses_global_timeout);
+            if let Err(e) = asr.send_last_frame().await {
+                log::error!("[coord] Bailian send last frame failed: {e}");
+            }
+            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => {
+                    log::error!("[coord] Bailian await final failed: {e}");
+                    // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
+                    asr.cancel();
+                    Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
+                }
+                Err(_) => {
+                    log::error!(
+                        "[coord] Bailian 全局超时 {} 秒",
+                        COORDINATOR_GLOBAL_TIMEOUT_SECS
+                    );
+                    asr.cancel();
+                    Err(TranscribeFail::new(
+                        "识别超时".to_string(),
+                        "bailian global timeout".to_string(),
+                    ))
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        ActiveAsr::FoundryLocalWhisper(local) => {
+            debug_assert!(!uses_global_timeout);
+            match local
+                .transcribe(foundry_audio_transcribe_timeout_duration())
+                .await
+            {
+                Ok(r) => {
+                    schedule_foundry_local_asr_release(
+                        inner,
+                        AsrReleaseSession::Dictation(current_session_id),
+                    );
+                    Ok(r)
+                }
+                Err(e) => {
+                    if processing_cancelled.load(Ordering::SeqCst) {
+                        log::info!(
+                            "[coord] Foundry Local Whisper transcribe cancelled — discarding transcript"
+                        );
+                        schedule_foundry_local_asr_release(
+                            inner,
+                            AsrReleaseSession::Dictation(current_session_id),
+                        );
+                        restore_prepared_windows_ime_session(inner, current_session_id);
+                        set_phase_idle_if_session_matches(inner, current_session_id);
+                        return Ok(());
+                    }
+                    log::error!("[coord] Foundry Local Whisper transcribe failed: {e:#}");
+                    schedule_foundry_local_asr_release(
+                        inner,
+                        AsrReleaseSession::Dictation(current_session_id),
+                    );
+                    Err(TranscribeFail::new(
+                        format!("本地识别失败: {e}"),
+                        e.to_string(),
+                    ))
+                }
+            }
+        }
+        // Windows sherpa-onnx offline batch：停止录音后整段转写，再复用现有
+        // polish / insert / history 收尾路径。
+        #[cfg(target_os = "windows")]
+        ActiveAsr::SherpaOnnxLocal(local) => {
+            debug_assert!(!uses_global_timeout);
+            match local
+                .transcribe(sherpa_audio_transcribe_timeout_duration())
+                .await
+            {
+                Ok(r) => {
+                    schedule_sherpa_onnx_release(
+                        inner,
+                        AsrReleaseSession::Dictation(current_session_id),
+                    );
+                    Ok(r)
+                }
+                Err(e) => {
+                    if processing_cancelled.load(Ordering::SeqCst) {
+                        log::info!(
+                            "[coord] sherpa-onnx transcribe cancelled — discarding transcript"
+                        );
+                        schedule_sherpa_onnx_release(
+                            inner,
+                            AsrReleaseSession::Dictation(current_session_id),
+                        );
+                        restore_prepared_windows_ime_session(inner, current_session_id);
+                        set_phase_idle_if_session_matches(inner, current_session_id);
+                        return Ok(());
+                    }
+                    log::error!("[coord] sherpa-onnx transcribe failed: {e:#}");
+                    schedule_sherpa_onnx_release(
+                        inner,
+                        AsrReleaseSession::Dictation(current_session_id),
+                    );
+                    Err(TranscribeFail::new(
+                        format!("本地识别失败: {e}"),
+                        e.to_string(),
+                    ))
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        ActiveAsr::Local(local) => {
+            debug_assert!(uses_global_timeout);
+            // 缓存命中时 transcribe 不含 load 时间；冷启动 load 已在 build_local_qwen3
+            // 提前完成。但 transcribe 本身受音频长度影响：用户实测 RTF ≈ 0.3，慢机
+            // 可达 0.5；15s 固定超时在 ≥ 30s 录音上会把整段结果丢掉。改用动态
+            // 超时 max(15, ceil(audio_s × 0.6) + 10)，公式与单测见
+            // `local_qwen_transcribe_timeout`。
+            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
+            log::info!(
+                "[coord] local Qwen3-ASR transcribe: audio={:.2}s timeout={}s",
+                audio_secs,
+                timeout_duration.as_secs()
+            );
+            let result = tokio::time::timeout(timeout_duration, local.transcribe()).await;
+            inner.local_asr_cache.touch();
+            schedule_local_asr_release(inner);
+            match result {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => {
+                    log::error!("[coord] local Qwen3-ASR transcribe failed: {e:#}");
+                    Err(TranscribeFail::new(
+                        format!("本地识别失败: {e}"),
+                        e.to_string(),
+                    ))
+                }
+                Err(_) => {
+                    log::error!(
+                        "[coord] local Qwen3-ASR 动态超时 {}s（音频 {:.2}s）",
                         timeout_duration.as_secs(),
                         audio_secs
                     );
-                    match tokio::time::timeout(timeout_duration, e.transcribe()).await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(error)) => {
-                            log::error!("[coord] ElevenLabs ASR transcribe failed: {error}");
-                            Err(TranscribeFail::new(
-                                format!("识别失败: {error}"),
-                                error.to_string(),
-                            ))
-                        }
-                        Err(_) => Err(TranscribeFail::new(
-                            "识别超时".to_string(),
-                            "elevenlabs dynamic timeout".to_string(),
-                        )),
-                    }
+                    Err(TranscribeFail::new(
+                        "识别超时".to_string(),
+                        "local global timeout".to_string(),
+                    ))
                 }
-                ActiveAsr::Bailian(asr) => {
-                    debug_assert!(uses_global_timeout);
-                    if let Err(e) = asr.send_last_frame().await {
-                        log::error!("[coord] Bailian send last frame failed: {e}");
+            }
+        }
+        // Apple Speech：系统语音识别，无模型加载耗时。批处理 transcribe 受音频
+        // 长度影响，沿用 local_qwen_transcribe_timeout 的动态超时公式。
+        #[cfg(target_os = "macos")]
+        ActiveAsr::AppleSpeech(local) => {
+            debug_assert!(uses_global_timeout);
+            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
+            log::info!(
+                "[coord] Apple Speech transcribe: audio={:.2}s timeout={}s",
+                audio_secs,
+                timeout_duration.as_secs()
+            );
+            match tokio::time::timeout(timeout_duration, local.transcribe()).await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => {
+                    if processing_cancelled.load(Ordering::SeqCst) {
+                        log::info!(
+                            "[coord] Apple Speech transcribe cancelled - discarding transcript"
+                        );
+                        restore_prepared_windows_ime_session(inner, current_session_id);
+                        set_phase_idle_if_session_matches(inner, current_session_id);
+                        return Ok(());
                     }
-                    let timeout_duration =
-                        std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-                    match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => {
-                            log::error!("[coord] Bailian await final failed: {e}");
-                            // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
-                            asr.cancel();
-                            Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "[coord] Bailian 全局超时 {} 秒",
-                                COORDINATOR_GLOBAL_TIMEOUT_SECS
-                            );
-                            asr.cancel();
-                            Err(TranscribeFail::new(
-                                "识别超时".to_string(),
-                                "bailian global timeout".to_string(),
-                            ))
-                        }
-                    }
+                    log::error!("[coord] Apple Speech transcribe failed: {e:#}");
+                    Err(TranscribeFail::new(
+                        format!("本地识别失败: {e}"),
+                        e.to_string(),
+                    ))
                 }
-                ActiveAsr::Qwen3Realtime(asr) => {
-                    debug_assert!(uses_global_timeout);
-                    if let Err(e) = asr.send_last_frame().await {
-                        log::error!("[coord] Qwen3 realtime send last frame failed: {e}");
-                    }
-                    let timeout_duration =
-                        std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-                    match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => {
-                            log::error!("[coord] Qwen3 realtime await final failed: {e}");
-                            // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
-                            asr.cancel();
-                            Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "[coord] Qwen3 realtime 全局超时 {} 秒",
-                                COORDINATOR_GLOBAL_TIMEOUT_SECS
-                            );
-                            asr.cancel();
-                            Err(TranscribeFail::new(
-                                "识别超时".to_string(),
-                                "qwen3 realtime global timeout".to_string(),
-                            ))
-                        }
-                    }
-                }
-                #[cfg(target_os = "windows")]
-                ActiveAsr::FoundryLocalWhisper(local) => {
-                    debug_assert!(!uses_global_timeout);
-                    let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-                    let timeout_duration = windows_local_asr_transcribe_timeout(audio_secs);
-                    log::info!(
-                        "[coord] Foundry Local Whisper transcribe: audio={:.2}s timeout={}s",
-                        audio_secs,
-                        timeout_duration.as_secs()
+                Err(_) => {
+                    log::error!(
+                        "[coord] Apple Speech 动态超时 {}s（音频 {:.2}s）",
+                        timeout_duration.as_secs(),
+                        audio_secs
                     );
-                    match local.transcribe(timeout_duration).await {
-                        Ok(r) => {
-                            schedule_foundry_local_asr_release(
-                                inner,
-                                AsrReleaseSession::Dictation(current_session_id),
-                            );
-                            Ok(r)
-                        }
-                        Err(e) => {
-                            // 用户取消现在由外层 select! 统一处理（drop 掉本 future 中断在途转写），
-                            // 到这里的 Err 一律当作真失败：调度引擎释放 + 交给 match 后的重试/报错。
-                            log::error!("[coord] Foundry Local Whisper transcribe failed: {e:#}");
-                            schedule_foundry_local_asr_release(
-                                inner,
-                                AsrReleaseSession::Dictation(current_session_id),
-                            );
-                            Err(TranscribeFail::new(
-                                format!("本地识别失败: {e}"),
-                                e.to_string(),
-                            ))
-                        }
-                    }
+                    Err(TranscribeFail::new(
+                        "识别超时".to_string(),
+                        "apple-speech global timeout".to_string(),
+                    ))
                 }
-                // Windows sherpa-onnx offline batch：停止录音后整段转写，再复用现有
-                // polish / insert / history 收尾路径。
-                #[cfg(target_os = "windows")]
-                ActiveAsr::SherpaOnnxLocal(local) => {
-                    debug_assert!(!uses_global_timeout);
-                    let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-                    let timeout_duration = windows_local_asr_transcribe_timeout(audio_secs);
-                    log::info!(
-                        "[coord] sherpa-onnx transcribe: audio={:.2}s timeout={}s",
-                        audio_secs,
-                        timeout_duration.as_secs()
-                    );
-                    match local.transcribe(timeout_duration).await {
-                        Ok(r) => {
-                            schedule_sherpa_onnx_release(
-                                inner,
-                                AsrReleaseSession::Dictation(current_session_id),
-                            );
-                            Ok(r)
-                        }
-                        Err(e) => {
-                            // 取消由外层 select! 统一处理，见 Foundry 分支同款注释。
-                            log::error!("[coord] sherpa-onnx transcribe failed: {e:#}");
-                            schedule_sherpa_onnx_release(
-                                inner,
-                                AsrReleaseSession::Dictation(current_session_id),
-                            );
-                            Err(TranscribeFail::new(
-                                format!("本地识别失败: {e}"),
-                                e.to_string(),
-                            ))
-                        }
-                    }
-                }
-                #[cfg(target_os = "macos")]
-                ActiveAsr::Local(local) => {
-                    debug_assert!(uses_global_timeout);
-                    // 缓存命中时 transcribe 不含 load 时间；冷启动 load 已在 build_local_qwen3
-                    // 提前完成。但 transcribe 本身受音频长度影响：用户实测 RTF ≈ 0.3，慢机
-                    // 可达 0.5；15s 固定超时在 ≥ 30s 录音上会把整段结果丢掉。改用动态
-                    // 超时 max(15, ceil(audio_s × 0.6) + 10)，公式与单测见
-                    // `local_qwen_transcribe_timeout`。
-                    let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-                    let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
-                    log::info!(
-                        "[coord] local Qwen3-ASR transcribe: audio={:.2}s timeout={}s",
-                        audio_secs,
-                        timeout_duration.as_secs()
-                    );
-                    let result = tokio::time::timeout(timeout_duration, local.transcribe()).await;
-                    inner.local_asr_cache.touch();
-                    schedule_local_asr_release(inner);
-                    match result {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => {
-                            log::error!("[coord] local Qwen3-ASR transcribe failed: {e:#}");
-                            Err(TranscribeFail::new(
-                                format!("本地识别失败: {e}"),
-                                e.to_string(),
-                            ))
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "[coord] local Qwen3-ASR 动态超时 {}s（音频 {:.2}s）",
-                                timeout_duration.as_secs(),
-                                audio_secs
-                            );
-                            Err(TranscribeFail::new(
-                                "识别超时".to_string(),
-                                "local global timeout".to_string(),
-                            ))
-                        }
-                    }
-                }
-                // Apple Speech：系统语音识别，无模型加载耗时。批处理 transcribe 受音频
-                // 长度影响，沿用 local_qwen_transcribe_timeout 的动态超时公式。
-                #[cfg(target_os = "macos")]
-                ActiveAsr::AppleSpeech(local) => {
-                    debug_assert!(uses_global_timeout);
-                    let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-                    let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
-                    log::info!(
-                        "[coord] Apple Speech transcribe: audio={:.2}s timeout={}s",
-                        audio_secs,
-                        timeout_duration.as_secs()
-                    );
-                    match tokio::time::timeout(timeout_duration, local.transcribe()).await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => {
-                            // 取消由外层 select! 统一处理，见 Foundry 分支同款注释。
-                            log::error!("[coord] Apple Speech transcribe failed: {e:#}");
-                            Err(TranscribeFail::new(
-                                format!("本地识别失败: {e}"),
-                                e.to_string(),
-                            ))
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "[coord] Apple Speech 动态超时 {}s（音频 {:.2}s）",
-                                timeout_duration.as_secs(),
-                                audio_secs
-                            );
-                            Err(TranscribeFail::new(
-                                "识别超时".to_string(),
-                                "apple-speech global timeout".to_string(),
-                            ))
-                        }
-                    }
-                }
-            };
-            transcribe_outcome
-        };
-        tokio::select! {
-            // biased：每次先查取消标志，取消优先于「转写恰好同时完成」。
-            biased;
-            _ = wait_for_processing_cancel(inner) => TranscribeRace::Cancelled,
-            outcome = transcribe_fut => TranscribeRace::Done(outcome),
+            }
         }
     };
 
-    let transcribe_outcome: Result<RawTranscript, TranscribeFail> = match raced {
-        TranscribeRace::Cancelled => {
-            log::info!("[coord] cancel during transcribe — 中断在途 ASR 请求，丢弃转写");
-            // 上面 select! 已把 transcribe_fut drop 掉（中断 reqwest / 停止等待流式结果 /
-            // 停止本地转写）；这里再显式 cancel 一次，促使流式 WebSocket 立即关闭、不残留
-            // 后台 worker。asr_for_cancel 与被 drop 的 future 共享同一 Arc 底层。
-            let asr_for_release = asr_for_cancel.clone();
-            cancel_active_asr(asr_for_cancel);
-            // end_session 已经把 ASR 从 inner.asr 取走，cancel_session 无法再触发
-            // provider 的释放调度；取消路径必须自己补上，否则本地模型会一直占用缓存。
-            schedule_cancelled_asr_release(inner, &asr_for_release, current_session_id);
-            restore_prepared_windows_ime_session(inner, current_session_id);
-            // 与下方「ASR 完成后 cancel 检查」同款收尾（finish_cancelled_processing 负责
-            // 把 phase 收回 Idle、清 focus_target）。
-            finish_cancelled_processing(inner, current_session_id);
-            return Ok(());
-        }
-        TranscribeRace::Done(outcome) => outcome,
-    };
-
-    // ASR 完成后 cancel 检查：转写恰好跑完、用户几乎同时按 Esc（select! 走了 Done 分支）时
-    // 这里兜底命中。上面赛跑分支处理的是「转写还在途中」的取消。
+    // ASR 完成后 cancel 检查：用户在 transcribe 进行中按 Esc 时，这里就会命中。
     // 优先级高于 empty 检查 — 用户取消 → 静默丢弃，不写失败历史也不弹错误胶囊。
-    if inner.state.lock().cancelled {
+    if processing_cancelled.load(Ordering::SeqCst) {
         log::info!("[coord] cancel detected after ASR — discarding transcript");
         restore_prepared_windows_ime_session(inner, current_session_id);
-        // PR #387 的「cancel 后清 focus_target」契约要在 Processing 路径上也成立。
-        // cancel_session 在 Processing 阶段故意跳过 finish_cancel_session_state（让
-        // 这里收尾），但此前的 end_session 没把 focus_target 清掉。logic-review
-        // 2026-05-10 P3 (🚩) 把这条补完。
-        finish_cancelled_processing(inner, current_session_id);
         return Ok(());
     }
 
@@ -2842,28 +2506,21 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     // 继续走润色/插入；彻底失败才 fail_dictation 保留录音 + 报错（音频仍在，可去历史手动重转）。
     let raw = match transcribe_outcome {
         Ok(raw) => raw,
-        Err(fail) => match try_silent_retranscribe(inner, current_session_id).await {
-            SilentRetryOutcome::Transcript(raw) => raw,
-            SilentRetryOutcome::Cancelled => {
-                log::info!("[coord] cancel during silent ASR retry — discarding transcript");
-                restore_prepared_windows_ime_session(inner, current_session_id);
-                finish_cancelled_processing(inner, current_session_id);
-                return Ok(());
-            }
-            SilentRetryOutcome::Exhausted => {
-                // 处理最后一次重试结果时也复查一次取消标志，覆盖「重试刚返回
-                // Exhausted 与用户同时按 Esc」的窄竞态，避免误走失败提示。
-                if inner.state.lock().cancelled {
-                    log::info!(
-                        "[coord] cancel after silent ASR retry — discarding transcript"
-                    );
-                    restore_prepared_windows_ime_session(inner, current_session_id);
-                    finish_cancelled_processing(inner, current_session_id);
-                    return Ok(());
+        Err(fail) => {
+            match try_silent_retranscribe(inner, current_session_id, has_audio_recording).await {
+                Some(raw) => raw,
+                None => {
+                    return fail_dictation(
+                        inner,
+                        current_session_id,
+                        elapsed,
+                        has_audio_recording,
+                        fail.user_msg,
+                        fail.err,
+                    )
                 }
-                return fail_dictation(inner, current_session_id, elapsed, fail.user_msg, fail.err)
             }
-        },
+        }
     };
 
     // ASR 返回空转写护栏（来自 PR #66）：写一条 emptyTranscript 失败历史 + 错误胶囊，
@@ -2903,7 +2560,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             // empty-transcript（ASR 没识别到任何文字）也保留 wav 标记——这是用户最想
             // 通过原始录音定位"是不是麦克风太小声 / ASR 模型问题"的场景。修 pr_agent
             // "Missing Audio" 反馈。
-            has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
+            has_audio_recording: Some(has_audio_recording),
         };
         let prefs_snapshot = inner.prefs.get();
         if let Err(e) = inner.history.append_with_retention(
@@ -2913,16 +2570,14 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         ) {
             log::error!("[coord] history append failed: {e}");
         }
-        emit_capsule(
+        emit_processing_capsule(
             inner,
             CapsuleState::Error,
-            0.0,
             elapsed,
             Some("没有识别到语音".to_string()),
             None,
         );
         restore_prepared_windows_ime_session(inner, current_session_id);
-        inner.state.lock().phase = SessionPhase::Idle;
         schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
         return Err("ASR returned empty transcript".to_string());
     }
@@ -2932,9 +2587,8 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     // audio_archive_active 翻成 false，让下游 history 的 has_audio_recording 读到真实状态
     // （成功条目不会渲染播放/重转按钮再 404）。debug 用户：保留全部录音（原调试行为）。
     // 失败/超时路径在上面的 match 内就产出 Err 并走 fail_dictation，不会走到这里，失败录音始终留存。
-    if !inner.prefs.get().record_audio_for_debug
-        && inner.audio_archive_active.swap(false, Ordering::Relaxed)
-    {
+    if !inner.prefs.get().record_audio_for_debug && has_audio_recording {
+        has_audio_recording = false;
         if let Ok(path) =
             crate::persistence::recording_path_for_session(&current_session_id.to_string())
         {
@@ -2953,7 +2607,6 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             Vec::new()
         }
     };
-    let front_app = inner.state.lock().front_app.clone();
     if !correction_rules.is_empty() {
         let corrected = apply_correction_rules(&raw.text, &correction_rules);
         if corrected != raw.text {
@@ -2967,12 +2620,12 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     }
 
     // Cloud Agent 语音分流：长按升级的会话不走润色/插入，转写交给 Claude 跑任务、结果弹胶囊。
-    if inner.state.lock().voice_agent {
+    if voice_agent {
         return run_voice_agent_transcript(inner, current_session_id, raw.text.clone(), elapsed)
             .await;
     }
 
-    emit_capsule(inner, CapsuleState::Polishing, 0.0, elapsed, None, None);
+    emit_processing_capsule(inner, CapsuleState::Polishing, elapsed, None, None);
 
     let prefs = inner.prefs.get();
     let pack = match inner
@@ -2996,8 +2649,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let style_system_prompt = pack.prompt.clone();
     let raw_uses_llm = mode == PolishMode::Raw && super::raw_style_pack_uses_llm(&pack);
     let translation_target = prefs.translation_target_language.trim().to_string();
-    let translation_active =
-        inner.translation_modifier_seen.load(Ordering::SeqCst) && !translation_target.is_empty();
+    let translation_active = translation_modifier_seen && !translation_target.is_empty();
     log::info!(
         "[style-pack] runtime dispatch session_id={} active_pack={} kind={:?} mode={:?} raw_chars={} prompt_chars={} raw_uses_llm={} translation_active={} hotwords={} working_languages={:?}",
         current_session_id,
@@ -3089,6 +2741,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             llm_thinking_enabled,
             front_app.as_deref(),
             &prior_turns,
+            Arc::clone(&processing_cancelled),
         )
         .await
     } else {
@@ -3118,34 +2771,19 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         &correction_rules,
         already_streamed,
     );
-    // 原子化最后一次 cancel 检查 + 转 Inserting：
-    // 在同一 lock 内决定「丢弃」还是「进入 Inserting」。一旦设到 Inserting，
-    // cancel_session 就拒绝介入（Cmd+V 已发出，撤销不掉）。这是 audit HIGH #2 的修复，
-    // 之前 check 与 inserter.insert 之间有窗口期。
-    //
-    // 流式路径例外：`already_streamed = true` 表示字符已经一边流一边落到光标了，
-    // 撤销不掉。即使 cancel 旗在中途被立起来，也只能尊重「已经发生」的事实，进入
-    // Inserting 状态完成 history / vocab 等收尾工作。
-    let proceed_to_insert = {
-        let mut state = inner.state.lock();
-        if state.cancelled && !already_streamed {
-            false
-        } else {
-            state.phase = SessionPhase::Inserting;
-            true
-        }
-    };
+    // Processing runs independently of the live capture lane. The per-job
+    // cancellation token is the only authority here; never mutate the shared
+    // SessionState because it may already belong to a newer recording.
+    let proceed_to_insert = !processing_cancelled.load(Ordering::SeqCst) || already_streamed;
     if !proceed_to_insert {
         log::info!(
             "[coord] cancel detected before insert — discarding output (chars={})",
             polished.chars().count()
         );
         restore_prepared_windows_ime_session(inner, current_session_id);
-        finish_cancelled_processing(inner, current_session_id);
         return Ok(());
     }
 
-    let focus_target = inner.state.lock().focus_target;
     let focus_ready_for_paste = restore_focus_target_if_possible(focus_target);
     let prefs = inner.prefs.get();
     let restore_clipboard = prefs.restore_clipboard_after_paste;
@@ -3189,11 +2827,11 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                                 .insert_via_unicode_keystrokes(&polished, sendinput_options)
                         }
                     }
-                    crate::types::WindowsInsertionMode::Paste => inner.inserter.insert(
-                        &polished,
-                        restore_clipboard,
-                        paste_shortcut,
-                    ),
+                    crate::types::WindowsInsertionMode::Paste => {
+                        inner
+                            .inserter
+                            .insert(&polished, restore_clipboard, paste_shortcut)
+                    }
                     crate::types::WindowsInsertionMode::Tsf => {
                         let ime_target = capture_ime_submit_target();
                         insert_with_windows_ime_first(
@@ -3292,7 +2930,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         dictionary_entry_count: Some(total_hits.min(u32::MAX as u64) as u32),
         // 用 begin_session 时 Recorder::start 返回的实际写盘状态，而不是 prefs 开关——
         // 开关打开但路径创建失败时这里是 false，避免前端渲染播放按钮后端 404。
-        has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
+        has_audio_recording: Some(has_audio_recording),
     };
     if let Err(e) = inner.history.append_with_retention(
         session,
@@ -3325,27 +2963,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         default_done_message(status, polish_error.is_some())
     };
 
-    emit_capsule(
+    emit_processing_capsule(
         inner,
         CapsuleState::Done,
-        0.0,
         elapsed,
         done_message,
         Some(inserted_chars),
     );
-
-    {
-        let mut state = inner.state.lock();
-        state.phase = SessionPhase::Idle;
-        state.focus_target = None;
-    }
-    // Toggle 模式冷却：设冷却时间戳，POST_SESSION_COOLDOWN_MS 内禁止新的 activate。
-    // 覆盖胶囊离场动画周期，避免三连按第 3 次误激活（issue #545）。
-    {
-        let now = std::time::Instant::now();
-        *inner.session_cooldown_until.lock() =
-            Some(now + std::time::Duration::from_millis(POST_SESSION_COOLDOWN_MS));
-    }
     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
 
     Ok(())
@@ -3402,7 +3026,7 @@ pub(super) fn cancel_session(inner: &Arc<Inner>) {
     }
     emit_capsule(inner, CapsuleState::Cancelled, 0.0, 0, None, None);
     log::info!("[coord] session cancelled (was {:?})", decision.phase);
-    schedule_capsule_idle(inner, CAPSULE_CANCEL_HIDE_DELAY_MS);
+    schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
     // 取消时也熄灭整屏彩虹描边（dictation session 没开描边，hide 是无害 no-op）。
     if let Some(app) = inner.app.lock().clone() {
         crate::hide_less_computer_glow(&app);

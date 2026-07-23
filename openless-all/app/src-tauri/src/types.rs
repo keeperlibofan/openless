@@ -649,10 +649,7 @@ pub struct UserPreferences {
     pub windows_sendinput_insertion_only: bool,
     /// Windows：SendInput 模式下是否在系统键盘列表（Win+Space）中显示 OpenLess TSF 输入法。
     /// 默认 true 保持现有行为；关闭后用户级禁用语言配置文件，无需管理员权限。
-    #[serde(
-        default = "default_true",
-        rename = "windowsShowOpenlessInKeyboardList"
-    )]
+    #[serde(default = "default_true", rename = "windowsShowOpenlessInKeyboardList")]
     pub windows_show_openless_in_keyboard_list: bool,
     /// 用户的工作语言（多选，原生名）。会作为前提注入 LLM polish/translate 的 system prompt 头部，
     /// 让模型知道该用户在哪些语言间工作。详见 issue #4。
@@ -855,7 +852,8 @@ pub struct UserPreferences {
     /// 用户在 Settings 里填生产 URL (如 https://api.openless-marketplace.com)。
     #[serde(default)]
     pub marketplace_base_url: String,
-    /// GitHub login 展示缓存。不用于认证；OAuth token 只存在 CredentialsVault。
+    /// Marketplace dev-mode 模拟登录用户名（GitHub login 风格）。生产换 OAuth token 后此字段废弃。
+    /// 上传 / 点赞需要带这个 header；空时上传被后端 401。
     #[serde(default)]
     pub marketplace_dev_login: String,
     /// Android: text insertion strategy for cross-app dictation results.
@@ -876,16 +874,6 @@ pub struct UserPreferences {
     /// Android: floating overlay control diameter in dp.
     #[serde(default = "default_android_overlay_size_dp")]
     pub android_overlay_size_dp: u32,
-}
-
-impl UserPreferences {
-    pub(crate) fn preserve_style_preferences_from(&mut self, current: &Self) {
-        self.default_mode = current.default_mode;
-        self.enabled_modes = current.enabled_modes.clone();
-        self.active_style_pack_id = current.active_style_pack_id.clone();
-        self.style_system_prompts = current.style_system_prompts.clone();
-        self.custom_style_prompts = current.custom_style_prompts.clone();
-    }
 }
 
 fn default_local_asr_model() -> String {
@@ -1294,122 +1282,6 @@ impl<'de> Deserialize<'de> for UserPreferences {
             ),
         })
     }
-}
-
-impl UserPreferences {
-    /// 逐字段抢救一份无法严格反序列化的 preferences.json。
-    ///
-    /// 背景：`UserPreferencesWire` 容器级 `#[serde(default)]` 已能容忍「缺字段」
-    /// （老文件读新版本）。真正会让整份解析失败、进而静默回落默认值（= 用户所有
-    /// 设置一次性丢光）的，是「字段存在但值非法」——例如某次重构改了枚举变体名 /
-    /// 字段类型，旧文件里的旧值在新版本里不再合法。这正是用户反馈「每次重装 app
-    /// 之后热键等设置就读不到」的根因路径。
-    ///
-    /// 抢救策略：把 JSON 当作对象，先归一化已知 alias，再逐 key 试解析。因为 Wire 对
-    /// 所有字段都有 default，单键对象 `{k: v}` 只有当 `v` 对字段 `k` 的类型非法时才会
-    /// 失败——据此精确剔除坏字段，保留其余全部有效设置（热键、模型选择、风格等都能
-    /// 活下来），最后再走一次正常反序列化。无法当作对象解析时才彻底回落默认。
-    pub(crate) fn salvage_from_json_bytes(bytes: &[u8]) -> Self {
-        let Ok(serde_json::Value::Object(mut map)) =
-            serde_json::from_slice::<serde_json::Value>(bytes)
-        else {
-            return Self::default();
-        };
-
-        normalize_preference_aliases(&mut map);
-
-        let mut cleaned = serde_json::Map::new();
-        for (key, value) in map {
-            if preference_field_is_valid(&key, &value) {
-                cleaned.insert(key, value);
-            } else {
-                log::warn!("[prefs] salvage dropping unparseable field: {key}");
-            }
-        }
-
-        match serde_json::from_value::<Self>(serde_json::Value::Object(cleaned.clone())) {
-            Ok(prefs) => prefs,
-            Err(err) => {
-                if let Some(prefs) = salvage_without_incomplete_legacy_hotkey(cleaned) {
-                    return prefs;
-                }
-                log::warn!(
-                    "[prefs] salvage still failed after field filtering: {err}; using defaults"
-                );
-                Self::default()
-            }
-        }
-    }
-}
-
-fn preference_field_is_valid(key: &str, value: &serde_json::Value) -> bool {
-    let probe =
-        serde_json::Value::Object(std::iter::once((key.to_string(), value.clone())).collect());
-    serde_json::from_value::<UserPreferencesWire>(probe).is_ok()
-}
-
-fn normalize_preference_aliases(map: &mut serde_json::Map<String, serde_json::Value>) {
-    for (canonical, alias) in [
-        ("windowsSendInputNewlineMode", "windowsSendinputNewlineMode"),
-        (
-            "windowsSendInputInsertionOnly",
-            "windowsSendinputInsertionOnly",
-        ),
-    ] {
-        let Some(alias_value) = map.remove(alias) else {
-            continue;
-        };
-        let canonical_valid = map
-            .get(canonical)
-            .map(|value| preference_field_is_valid(canonical, value));
-        let alias_valid = preference_field_is_valid(canonical, &alias_value);
-
-        match canonical_valid {
-            None => {
-                map.insert(canonical.to_string(), alias_value);
-            }
-            Some(true) => log::warn!(
-                "[prefs] salvage dropping duplicate legacy alias {alias}; canonical {canonical} wins"
-            ),
-            Some(false) if alias_valid => {
-                log::warn!(
-                    "[prefs] salvage replacing invalid canonical {canonical} with valid legacy alias {alias}"
-                );
-                map.insert(canonical.to_string(), alias_value);
-            }
-            Some(false) => {}
-        }
-    }
-}
-
-fn salvage_without_incomplete_legacy_hotkey(
-    mut map: serde_json::Map<String, serde_json::Value>,
-) -> Option<UserPreferences> {
-    let is_custom_legacy_hotkey = map
-        .get("hotkey")
-        .and_then(|value| value.get("trigger"))
-        .and_then(serde_json::Value::as_str)
-        == Some("custom");
-    if !is_custom_legacy_hotkey {
-        return None;
-    }
-
-    let has_dictation_hotkey = map
-        .get("dictationHotkey")
-        .and_then(|value| serde_json::from_value::<Option<ShortcutBinding>>(value.clone()).ok())
-        .flatten()
-        .is_some();
-    let has_custom_combo_hotkey = map
-        .get("customComboHotkey")
-        .and_then(|value| serde_json::from_value::<Option<ComboBinding>>(value.clone()).ok())
-        .flatten()
-        .is_some();
-    if has_dictation_hotkey || has_custom_combo_hotkey {
-        return None;
-    }
-
-    map.remove("hotkey");
-    serde_json::from_value::<UserPreferences>(serde_json::Value::Object(map)).ok()
 }
 
 fn default_qa_hotkey() -> Option<ShortcutBinding> {
@@ -2352,9 +2224,6 @@ pub enum HotkeyMode {
     Toggle,
     Hold,
     DoubleClick,
-    /// 自动识别：按下即开录；松手时按「按住时长」决定语义 —— 短按（< AUTO_HOLD_THRESHOLD）
-    /// 当作 Toggle（锁存，保持录音，下次按下再停），长按当作 Hold（松手即停）。
-    Auto,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2575,13 +2444,12 @@ impl HotkeyCapability {
         {
             return Self {
                 adapter: HotkeyAdapterKind::WindowsLowLevel,
-                // Windows 没有 Command 键：leftCommand/rightCommand 会被映射到 Win 键，
-                // 而单按 Win 会弹出开始菜单，实际无法作为录音热键使用。故不在 Windows
-                // 的常用单键预设里提供 Command 选项（issue #784）。
                 available_triggers: vec![
                     HotkeyTrigger::RightControl,
                     HotkeyTrigger::RightAlt,
                     HotkeyTrigger::LeftControl,
+                    HotkeyTrigger::RightCommand,
+                    HotkeyTrigger::LeftCommand,
                     HotkeyTrigger::LeftShift,
                     HotkeyTrigger::RightShift,
                     HotkeyTrigger::MediaPlayPause,
@@ -2851,51 +2719,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn salvage_preserves_valid_fields_when_one_value_is_invalid() {
-        // 模拟「某次重构改了枚举变体名」后的旧文件：defaultMode 是新版本已不存在的值，
-        // 但 dictationHotkey / activeAsrProvider 仍然合法。抢救必须保住合法字段，
-        // 只把非法字段回落默认——而不是整份丢光。
-        let json = br#"{
-            "defaultMode": "totally-removed-mode",
-            "dictationHotkey": { "primary": "LeftOption", "modifiers": [] },
-            "activeAsrProvider": "bailian-qwen3-realtime"
-        }"#;
-
-        // 严格解析必失败（否则这个测试没意义）。
-        assert!(serde_json::from_slice::<UserPreferences>(json).is_err());
-
-        let salvaged = UserPreferences::salvage_from_json_bytes(json);
-        assert_eq!(salvaged.dictation_hotkey.primary, "LeftOption");
-        assert_eq!(salvaged.active_asr_provider, "bailian-qwen3-realtime");
-        // 非法字段回落到默认，而不是让整份解析失败。
-        assert_eq!(
-            salvaged.default_mode,
-            UserPreferences::default().default_mode
-        );
-    }
-
-    #[test]
-    fn salvage_normalizes_duplicate_legacy_aliases_without_resetting_other_fields() {
-        let json = br#"{
-            "windowsSendInputInsertionOnly": false,
-            "windowsSendinputInsertionOnly": true,
-            "windowsSendInputNewlineMode": "removed-mode",
-            "windowsSendinputNewlineMode": "shiftEnter",
-            "activeAsrProvider": "preserved-provider"
-        }"#;
-
-        assert!(serde_json::from_slice::<UserPreferences>(json).is_err());
-
-        let salvaged = UserPreferences::salvage_from_json_bytes(json);
-        assert!(!salvaged.windows_sendinput_insertion_only);
-        assert_eq!(
-            salvaged.windows_sendinput_newline_mode,
-            WindowsSendInputNewlineMode::ShiftEnter
-        );
-        assert_eq!(salvaged.active_asr_provider, "preserved-provider");
-    }
-
-    #[test]
     fn non_tsf_insertion_fallback_defaults_to_enabled() {
         let prefs = UserPreferences::default();
 
@@ -2925,7 +2748,10 @@ mod tests {
         let prefs: UserPreferences =
             serde_json::from_str(r#"{"windowsSendInputInsertionOnly": true}"#).unwrap();
         assert!(prefs.windows_sendinput_insertion_only);
-        assert_eq!(prefs.windows_insertion_mode, WindowsInsertionMode::SendInput);
+        assert_eq!(
+            prefs.windows_insertion_mode,
+            WindowsInsertionMode::SendInput
+        );
     }
 
     #[test]
@@ -2933,7 +2759,10 @@ mod tests {
         let prefs: UserPreferences =
             serde_json::from_str(r#"{"windowsSendinputInsertionOnly": true}"#).unwrap();
         assert!(prefs.windows_sendinput_insertion_only);
-        assert_eq!(prefs.windows_insertion_mode, WindowsInsertionMode::SendInput);
+        assert_eq!(
+            prefs.windows_insertion_mode,
+            WindowsInsertionMode::SendInput
+        );
     }
 
     #[test]
@@ -2999,7 +2828,10 @@ mod tests {
         assert!(json.contains(r#""windowsInsertionMode":"sendInput""#));
         let restored: UserPreferences = serde_json::from_str(&json).unwrap();
         assert!(restored.windows_sendinput_insertion_only);
-        assert_eq!(restored.windows_insertion_mode, WindowsInsertionMode::SendInput);
+        assert_eq!(
+            restored.windows_insertion_mode,
+            WindowsInsertionMode::SendInput
+        );
     }
 
     #[test]
@@ -3251,20 +3083,6 @@ mod tests {
         );
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn salvage_preserves_valid_fields_when_legacy_custom_hotkey_is_incomplete() {
-        let json = br#"{
-            "hotkey": { "trigger": "custom", "mode": "toggle", "keys": null },
-            "activeAsrProvider": "preserved-provider"
-        }"#;
-
-        assert!(serde_json::from_slice::<UserPreferences>(json).is_err());
-
-        let salvaged = UserPreferences::salvage_from_json_bytes(json);
-        assert_eq!(salvaged.active_asr_provider, "preserved-provider");
-        assert_eq!(salvaged.hotkey, UserPreferences::default().hotkey);
     }
 
     #[test]

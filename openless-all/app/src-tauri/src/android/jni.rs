@@ -188,12 +188,11 @@ pub mod android {
             &[JValue::Object(&action_obj)],
         )
         .map_err(|error| format!("set service action: {error}"))?;
-        let start_method =
-            if action.ends_with(".START_RECORDING") && android_sdk_int(env)? >= 26 {
-                "startForegroundService"
-            } else {
-                "startService"
-            };
+        let start_method = if action.ends_with(".START_RECORDING") && android_sdk_int(env)? >= 26 {
+            "startForegroundService"
+        } else {
+            "startService"
+        };
         env.call_method(
             context,
             start_method,
@@ -312,10 +311,7 @@ pub mod android {
 
     /// 读取剪贴板当前的第一条纯文本内容，用于在粘贴后还原。
     /// 失败或剪贴板为空时返回 None（不返回错误，避免阻塞主流程）。
-    pub fn get_primary_clip_text(
-        env: &mut JNIEnv,
-        context: &JObject,
-    ) -> Option<String> {
+    pub fn get_primary_clip_text(env: &mut JNIEnv, context: &JObject) -> Option<String> {
         let clipboard_name = jobject_str(env, "clipboard").ok()?;
         let clipboard = env
             .call_method(
@@ -351,12 +347,7 @@ pub mod android {
             return None;
         }
         let text_val = env
-            .call_method(
-                &item,
-                "getText",
-                "()Ljava/lang/CharSequence;",
-                &[],
-            )
+            .call_method(&item, "getText", "()Ljava/lang/CharSequence;", &[])
             .and_then(|value| value.l())
             .ok()?;
         if text_val.is_null() {
@@ -504,9 +495,14 @@ pub mod android {
         env: &mut JNIEnv<'local>,
         context: &JObject<'local>,
     ) -> Result<JObject<'local>, String> {
-        env.call_method(context, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
-            .and_then(|value| value.l())
-            .map_err(|error| format!("Context.getContentResolver: {error}"))
+        env.call_method(
+            context,
+            "getContentResolver",
+            "()Landroid/content/ContentResolver;",
+            &[],
+        )
+        .and_then(|value| value.l())
+        .map_err(|error| format!("Context.getContentResolver: {error}"))
     }
 
     fn jstring_object_to_option<'local>(
@@ -626,12 +622,7 @@ pub mod android {
             return Ok(false);
         }
         let now = env
-            .call_static_method(
-                "java/lang/System",
-                "currentTimeMillis",
-                "()J",
-                &[],
-            )
+            .call_static_method("java/lang/System", "currentTimeMillis", "()J", &[])
             .and_then(|value| value.j())
             .map_err(|error| format!("System.currentTimeMillis: {error}"))?;
         Ok(now.saturating_sub(last_heartbeat) <= ACCESSIBILITY_HEARTBEAT_STALE_MS)

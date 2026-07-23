@@ -25,16 +25,16 @@ use crate::asr::local::{
     foundry, sherpa, FoundryLocalRuntime, FoundryLocalWhisperAsr, SherpaOnnxAsr, SherpaOnnxRuntime,
 };
 use crate::asr::{
-    BailianCredentials, BailianRealtimeASR, DashScopeMultimodalASR, DictionaryHotword,
-    ElevenLabsBatchASR, MimoBatchASR, Qwen3RealtimeASR, Qwen3RealtimeCredentials, RawTranscript,
+    BailianCredentials, BailianRealtimeASR, DictionaryHotword, MimoBatchASR, RawTranscript,
     VolcengineCredentials, VolcengineStreamingASR, WhisperBatchASR,
 };
 use crate::combo_hotkey::{ComboHotkeyError, ComboHotkeyEvent, ComboHotkeyMonitor};
 use crate::coordinator_state::{
     begin_cancel_session_state, begin_recording_abort_before_restore, begin_session_state,
-    finish_cancel_session_state, finish_starting_session_state, new_session_id,
-    publish_abort_idle_after_restore, start_processing_if_listening, startup_race_status,
-    BeginOutcome, SessionId, SessionPhase, SessionState, StartupRaceStatus,
+    finish_cancel_session_state, finish_capture_for_processing_state,
+    finish_starting_session_state, new_session_id, publish_abort_idle_after_restore,
+    start_processing_if_listening, startup_race_status, BeginOutcome, FinishedCaptureState,
+    OrderedProcessingQueue, SessionId, SessionPhase, SessionState, StartupRaceStatus,
 };
 use crate::correction::apply_correction_rules;
 use crate::hotkey::{HotkeyEvent, HotkeyMonitor};
@@ -180,12 +180,7 @@ enum ActiveAsr {
     Volcengine(Arc<VolcengineStreamingASR>),
     Whisper(Arc<WhisperBatchASR>),
     Mimo(Arc<MimoBatchASR>),
-    /// 百炼 Fun-ASR-Flash 录音文件识别（DashScope multimodal-generation 批量 HTTP）。
-    DashScopeMultimodal(Arc<DashScopeMultimodalASR>),
-    ElevenLabs(Arc<ElevenLabsBatchASR>),
     Bailian(Arc<BailianRealtimeASR>),
-    /// 百炼 Qwen3-ASR-Flash 实时（OpenAI Realtime 风格 WS 协议）。
-    Qwen3Realtime(Arc<Qwen3RealtimeASR>),
     #[cfg(target_os = "windows")]
     FoundryLocalWhisper(Arc<FoundryLocalWhisperAsr>),
     /// Windows sherpa-onnx 本地 ASR（offline batch + 实验 online streaming）。
@@ -197,6 +192,14 @@ enum ActiveAsr {
     /// Apple Speech（SFSpeechRecognizer）系统本地 ASR；只在 macOS 可达。
     #[cfg(target_os = "macos")]
     AppleSpeech(Arc<crate::asr::local::AppleSpeechAsr>),
+}
+
+struct PendingDictation {
+    capture: FinishedCaptureState,
+    asr: ActiveAsr,
+    translation_active: bool,
+    has_audio_recording: bool,
+    cancelled: Arc<AtomicBool>,
 }
 
 fn asr_transcribe_uses_global_timeout(asr: &ActiveAsr) -> bool {
@@ -211,192 +214,24 @@ fn asr_transcribe_uses_global_timeout(asr: &ActiveAsr) -> bool {
     }
 }
 
-/// 单一分类来源：云端 ASR provider id → 协议种类。本地/无凭据引擎（local qwen3 /
-/// apple speech / foundry / sherpa）由各调用点在此之前用平台 cfg 门单独处理，不进
-/// 这个枚举。
-///
-/// **加新云端通道的唯一改动点**：在 [`active_asr_provider_kind`] 加一条 id 映射，
-/// 然后 [`ActiveAsrProviderKind::preflight_credential`] /
-/// [`ActiveAsrProviderKind::configured_fields`] 与各 build/dispatch 的穷尽 `match`
-/// 会被编译器逐个报错逼你补齐——不会再出现「装完才发现某处漏了」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ActiveAsrProviderKind {
+enum ActiveAsrProviderKind {
     Bailian,
-    Qwen3Realtime,
     Mimo,
-    DashScopeMultimodal,
-    ElevenLabs,
     WhisperCompatible,
     Volcengine,
 }
 
-/// 「能否开始一次会话」所需的凭据形态（对应 `ensure_asr_credentials` 预检门）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AsrPreflightCredential {
-    /// 需要 ASR API Key（endpoint/model 有默认值兜底）。
-    AsrApiKey,
-    /// 需要火山引擎 App Key + Access Key。
-    VolcAppKey,
-}
-
-/// 概览页「已配置 / 未配置」状态所需的字段（对应 `asr_configured_for_provider`）。
-/// 语义与预检门**有意不同**：预检问「能否开始」，这里问「preset 要求的字段填齐没」。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AsrConfiguredFields {
-    /// 只看 API Key（endpoint/model 走默认）：bailian / qwen3 实时。
-    ApiKeyOnly,
-    /// API Key + endpoint + model 都要填：mimo / dashscope multimodal。
-    ApiKeyEndpointModel,
-    /// 只看 endpoint + model（不含 API Key）：Whisper 兼容厂商。
-    EndpointModelOnly,
-    /// 火山引擎三件套。
-    VolcAppKey,
-}
-
-impl ActiveAsrProviderKind {
-    pub(crate) fn preflight_credential(self) -> AsrPreflightCredential {
-        match self {
-            ActiveAsrProviderKind::Bailian
-            | ActiveAsrProviderKind::Qwen3Realtime
-            | ActiveAsrProviderKind::Mimo
-            | ActiveAsrProviderKind::DashScopeMultimodal
-            | ActiveAsrProviderKind::ElevenLabs
-            | ActiveAsrProviderKind::WhisperCompatible => AsrPreflightCredential::AsrApiKey,
-            ActiveAsrProviderKind::Volcengine => AsrPreflightCredential::VolcAppKey,
-        }
-    }
-
-    pub(crate) fn configured_fields(self) -> AsrConfiguredFields {
-        match self {
-            ActiveAsrProviderKind::Bailian
-            | ActiveAsrProviderKind::Qwen3Realtime
-            | ActiveAsrProviderKind::ElevenLabs => {
-                AsrConfiguredFields::ApiKeyOnly
-            }
-            ActiveAsrProviderKind::Mimo | ActiveAsrProviderKind::DashScopeMultimodal => {
-                AsrConfiguredFields::ApiKeyEndpointModel
-            }
-            ActiveAsrProviderKind::WhisperCompatible => AsrConfiguredFields::EndpointModelOnly,
-            ActiveAsrProviderKind::Volcengine => AsrConfiguredFields::VolcAppKey,
-        }
-    }
-}
-
-pub(crate) fn active_asr_provider_kind(id: &str) -> ActiveAsrProviderKind {
+fn active_asr_provider_kind(id: &str) -> ActiveAsrProviderKind {
     if is_bailian_provider(id) {
         ActiveAsrProviderKind::Bailian
-    } else if is_qwen3_realtime_provider(id) {
-        ActiveAsrProviderKind::Qwen3Realtime
     } else if is_mimo_provider(id) {
         ActiveAsrProviderKind::Mimo
-    } else if is_dashscope_multimodal_provider(id) {
-        ActiveAsrProviderKind::DashScopeMultimodal
-    } else if is_elevenlabs_provider(id) {
-        ActiveAsrProviderKind::ElevenLabs
     } else if is_whisper_compatible_provider(id) {
         ActiveAsrProviderKind::WhisperCompatible
     } else {
         ActiveAsrProviderKind::Volcengine
     }
-}
-
-/// 统一「阿里云百炼」入口的模型 → 底层协议 id 路由。
-///
-/// 三条百炼协议（fun-asr-realtime 经典实时 / qwen3-asr-flash-realtime Realtime /
-/// fun-asr-flash 录音文件）在 UI 上收成一个 provider `bailian`（一把 key），**构建时**
-/// 按所选模型二次路由到具体协议客户端。凭据 / 「已配置」判定仍看真实 active
-/// `bailian`（→ ApiKeyOnly，一把 key），只有这里的 build 分发用得上 effective id。
-///
-/// 老用户若停在别名 id（`bailian-qwen3-realtime` / `bailian-fun-asr-flash`）上，
-/// 非 `bailian` 直接原样返回，各走各的旧路径——即「隐藏别名」向后兼容。
-pub(crate) fn resolve_effective_asr_provider(
-    active_asr: &str,
-    model: &str,
-) -> Result<String, String> {
-    if !is_bailian_provider(active_asr) {
-        if is_dashscope_multimodal_provider(active_asr) {
-            validate_dashscope_multimodal_model(model)?;
-        }
-        return Ok(active_asr.to_string());
-    }
-
-    // Android/iOS 继续使用原来的 Bailian WebSocket 配置。统一入口的模型路由
-    // 只在桌面端启用，避免共享设置页意外改变移动端行为。
-    if cfg!(mobile) {
-        return Ok(crate::asr::bailian::PROVIDER_ID.to_string());
-    }
-
-    let model = model.trim();
-    if model.is_empty() || is_classic_bailian_realtime_model(model) {
-        Ok(crate::asr::bailian::PROVIDER_ID.to_string())
-    } else if model.starts_with("qwen3-asr-flash-realtime") {
-        Ok(crate::asr::qwen_realtime::PROVIDER_ID.to_string())
-    } else if model == crate::asr::dashscope_multimodal::DEFAULT_MODEL {
-        Ok(crate::asr::dashscope_multimodal::PROVIDER_ID.to_string())
-    } else {
-        Err(format!(
-            "不支持的百炼 ASR 模型：{model}。支持 fun-asr-realtime、paraformer-realtime、sensevoice-realtime、qwen3-asr-flash-realtime 和 fun-asr-flash-2026-06-15"
-        ))
-    }
-}
-
-fn is_classic_bailian_realtime_model(model: &str) -> bool {
-    model.starts_with("fun-asr-realtime")
-        || model.starts_with("paraformer-realtime")
-        || model.starts_with("sensevoice-realtime")
-}
-
-pub(crate) fn validate_dashscope_multimodal_model(model: &str) -> Result<(), String> {
-    let model = model.trim();
-    if model.is_empty() || model == crate::asr::dashscope_multimodal::DEFAULT_MODEL {
-        return Ok(());
-    }
-    Err(format!(
-        "不支持的 DashScope 录音文件 ASR 模型：{model}。该协议仅支持 fun-asr-flash-2026-06-15；fun-asr-flash-8k-realtime 系列属于 8 kHz 实时 WebSocket 模型，当前尚未支持"
-    ))
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum BailianEndpointProtocol {
-    ClassicRealtime,
-    QwenRealtime,
-    Multimodal,
-}
-
-/// 统一百炼配置只需要表达区域/工作空间主机；具体协议的 scheme 与 path 由模型路由决定。
-/// 这样既能复用同一个 endpoint 字段，也不会把中国区默认网关强加给新加坡或专属工作空间。
-pub(crate) fn derive_bailian_endpoint(
-    endpoint: &str,
-    protocol: BailianEndpointProtocol,
-) -> Result<String, String> {
-    let default_endpoint = match protocol {
-        BailianEndpointProtocol::ClassicRealtime => crate::asr::bailian::DEFAULT_ENDPOINT,
-        BailianEndpointProtocol::QwenRealtime => crate::asr::qwen_realtime::DEFAULT_ENDPOINT,
-        BailianEndpointProtocol::Multimodal => crate::asr::dashscope_multimodal::DEFAULT_ENDPOINT,
-    };
-    let source = if endpoint.trim().is_empty() {
-        default_endpoint
-    } else {
-        endpoint.trim()
-    };
-    let mut url = url::Url::parse(source).map_err(|_| "endpointInvalid".to_string())?;
-    if url.host_str().is_none() {
-        return Err("endpointInvalid".to_string());
-    }
-    let (scheme, path) = match protocol {
-        BailianEndpointProtocol::ClassicRealtime => ("wss", "/api-ws/v1/inference/"),
-        BailianEndpointProtocol::QwenRealtime => ("wss", "/api-ws/v1/realtime"),
-        BailianEndpointProtocol::Multimodal => (
-            "https",
-            "/api/v1/services/aigc/multimodal-generation/generation",
-        ),
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| "endpointInvalid".to_string())?;
-    url.set_path(path);
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
 }
 
 fn batch_asr_chunk_limit_ms(provider_id: &str) -> Option<u64> {
@@ -427,6 +262,9 @@ struct Inner {
     #[cfg(target_os = "windows")]
     prepared_windows_ime_session: Arc<Mutex<Vec<PreparedWindowsImeSessionSlot>>>,
     state: Mutex<SessionState>,
+    /// Completed captures waiting for ASR finalization, polish, and insertion.
+    /// The queue has one worker, so insertion order always matches recording order.
+    processing_queue: Mutex<OrderedProcessingQueue<PendingDictation>>,
     asr: Mutex<Option<SessionResource<ActiveAsr>>>,
     /// 本地 Qwen3-ASR 引擎缓存。跨会话复用，避免每次重加载 1.2GB+ 模型。
     /// 释放时机由 prefs.local_asr_keep_loaded_secs 决定。
@@ -453,10 +291,6 @@ struct Inner {
     /// 与 `hotkey_trigger_held` 互补 —— held 防 press-without-release，本字段防
     /// press-release-press 三连过快。
     last_hotkey_dispatch_at: Mutex<Option<std::time::Instant>>,
-    /// Auto 模式下这次会话「按下」的事件时刻。松手时用按下/松开的事件时间戳差值
-    /// 判定短按（Toggle 锁存）还是长按（Hold 松手即停）。见 dictation.rs 的
-    /// AUTO_HOLD_THRESHOLD。
-    hotkey_press_at: Mutex<Option<std::time::Instant>>,
     /// end_session 成功收尾后将 phase 设为 Idle 时记录的时间戳 + POST_SESSION_COOLDOWN_MS。
     /// handle_pressed 在 (Toggle, Idle) 分支检查此字段：未过期则忽略该次按键，
     /// 防止胶囊离场动画期间误激活新听写（issue #545）。
@@ -538,55 +372,6 @@ struct PreparedWindowsImeSessionSlot {
     prepared: PreparedWindowsImeSession,
 }
 
-/// 历史音频静默重试的 ASR 资源护栏。
-///
-/// 重试 future 被 select 丢弃时，局部 QaAsrStart 不会再经过正常的
-/// end_session 收尾；这里用 Drop 补 cancel 和本地模型释放，尤其覆盖
-/// spawn_blocking 已经开始运行的本地 ASR。
-struct CancellableRetranscribeGuard {
-    inner: Arc<Inner>,
-    asr: Option<ActiveAsr>,
-    session_id: SessionId,
-}
-
-impl CancellableRetranscribeGuard {
-    fn new(inner: Arc<Inner>, asr: ActiveAsr, session_id: SessionId) -> Self {
-        Self {
-            inner,
-            asr: Some(asr),
-            session_id,
-        }
-    }
-
-    fn disarm(mut self) {
-        self.asr.take();
-    }
-}
-
-impl Drop for CancellableRetranscribeGuard {
-    fn drop(&mut self) {
-        let Some(asr) = self.asr.take() else {
-            return;
-        };
-        let asr_for_release = asr.clone();
-        cancel_active_asr(asr);
-        dictation::schedule_cancelled_asr_release(&self.inner, &asr_for_release, self.session_id);
-    }
-}
-
-#[cfg(not(mobile))]
-fn persist_and_commit_remote_pin(
-    slot: &Mutex<Option<String>>,
-    pin: String,
-    persist: impl FnOnce(&str) -> Result<(), String>,
-    refresh: impl FnOnce(),
-) -> Result<String, String> {
-    persist(&pin)?;
-    *slot.lock() = Some(pin.clone());
-    refresh();
-    Ok(pin)
-}
-
 impl Coordinator {
     pub fn new() -> Self {
         #[cfg(target_os = "windows")]
@@ -636,6 +421,7 @@ impl Coordinator {
                     correction_rules,
                     inserter: TextInserter::new(),
                     state: Mutex::new(SessionState::default()),
+                    processing_queue: Mutex::new(OrderedProcessingQueue::default()),
                     asr: Mutex::new(None),
                     recorder: Mutex::new(None),
                     audio_archive_active: AtomicBool::new(false),
@@ -644,7 +430,6 @@ impl Coordinator {
                     hotkey_status: Mutex::new(HotkeyStatus::default()),
                     hotkey_trigger_held: AtomicBool::new(false),
                     last_hotkey_dispatch_at: Mutex::new(None),
-                    hotkey_press_at: Mutex::new(None),
                     session_cooldown_until: Mutex::new(None),
                     shortcut_recording_active: AtomicBool::new(false),
                     combo_hotkey: Mutex::new(None),
@@ -737,6 +522,7 @@ impl Coordinator {
                 windows_ime: WindowsImeSessionController::new(),
                 prepared_windows_ime_session: Arc::new(Mutex::new(Vec::new())),
                 state: Mutex::new(SessionState::default()),
+                processing_queue: Mutex::new(OrderedProcessingQueue::default()),
                 asr: Mutex::new(None),
                 recorder: Mutex::new(None),
                 audio_archive_active: AtomicBool::new(false),
@@ -745,7 +531,6 @@ impl Coordinator {
                 hotkey_status: Mutex::new(HotkeyStatus::default()),
                 hotkey_trigger_held: AtomicBool::new(false),
                 last_hotkey_dispatch_at: Mutex::new(None),
-                hotkey_press_at: Mutex::new(None),
                 session_cooldown_until: Mutex::new(None),
                 shortcut_recording_active: AtomicBool::new(false),
                 combo_hotkey: Mutex::new(None),
@@ -1311,7 +1096,6 @@ impl Coordinator {
         close_qa_panel(&self.inner);
     }
 
-
     /// 用户点 ✕ / 按 Esc 关 Less Computer 浮窗：隐藏窗口 + 结束连续对话
     /// （下次说话开新会话，不再 --continue 续旧上下文）。
     pub fn less_computer_window_dismiss(&self) {
@@ -1339,8 +1123,7 @@ impl Coordinator {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             let session_id = crate::coordinator_state::new_session_id();
-            if let Err(e) =
-                dictation::run_voice_agent_transcript(&inner, session_id, text, 0).await
+            if let Err(e) = dictation::run_voice_agent_transcript(&inner, session_id, text, 0).await
             {
                 log::warn!("[less-computer] text submit run failed: {e}");
             }
@@ -1567,23 +1350,14 @@ impl Coordinator {
     }
 
     #[cfg(not(mobile))]
-    pub fn regenerate_remote_pin(self: &Arc<Self>) -> Result<String, String> {
+    pub fn regenerate_remote_pin(self: &Arc<Self>) -> String {
         let pin = crate::remote_server::generate_pin();
-        let app = self
-            .inner
-            .app
-            .lock()
-            .clone()
-            .ok_or_else(|| "OpenLess app handle is unavailable".to_string())?;
-        persist_and_commit_remote_pin(
-            &self.inner.remote_pin,
-            pin,
-            |pin| {
-                crate::remote_server::save_pin(&app, pin)
-                    .map_err(|error| format!("persist pairing PIN failed: {error}"))
-            },
-            || self.refresh_remote_server(),
-        )
+        *self.inner.remote_pin.lock() = Some(pin.clone());
+        if let Some(app) = self.inner.app.lock().clone() {
+            crate::remote_server::save_pin(&app, &pin);
+        }
+        self.refresh_remote_server();
+        pin
     }
 
     #[cfg(not(mobile))]
@@ -1626,24 +1400,12 @@ impl Coordinator {
             let Some(app) = app else {
                 return;
             };
-            let pin = if let Some(pin) = coord.inner.remote_pin.lock().clone() {
-                pin
-            } else {
-                match crate::remote_server::load_or_create_pin(&app) {
-                    Ok(pin) => {
-                        *coord.inner.remote_pin.lock() = Some(pin.clone());
-                        pin
-                    }
-                    Err(error) => {
-                        let reason = format!("persist pairing PIN failed: {error}");
-                        let _ = app.emit(
-                            "remote-input:error",
-                            serde_json::json!({"reason": reason, "port": prefs.remote_input_port}),
-                        );
-                        log::error!("[remote-input] {reason}");
-                        return;
-                    }
+            let pin = {
+                let mut guard = coord.inner.remote_pin.lock();
+                if guard.is_none() {
+                    *guard = Some(crate::remote_server::load_or_create_pin(&app));
                 }
+                guard.clone().unwrap_or_default()
             };
             let port = prefs.remote_input_port;
             match crate::remote_server::start(crate::remote_server::RemoteServerConfig {
@@ -1734,8 +1496,8 @@ impl Coordinator {
     #[cfg(any(debug_assertions, test))]
     pub async fn inject_hotkey_click_for_dev(&self) -> Result<(), String> {
         log::info!("[coord] dev hotkey injection started");
-            handle_pressed(&self.inner, std::time::Instant::now()).await;
-            handle_released(&self.inner, std::time::Instant::now()).await;
+        handle_pressed(&self.inner).await;
+        handle_released(&self.inner).await;
         cancel_session(&self.inner);
         Ok(())
     }
@@ -1794,43 +1556,13 @@ impl Coordinator {
     }
 
     pub async fn retranscribe_pcm(&self, pcm: Vec<u8>) -> Result<String, String> {
-        self.retranscribe_pcm_inner(pcm, false).await
-    }
-
-    pub(super) async fn retranscribe_pcm_until_cancelled(
-        &self,
-        pcm: Vec<u8>,
-    ) -> Result<String, String> {
-        self.retranscribe_pcm_inner(pcm, true).await
-    }
-
-    async fn retranscribe_pcm_inner(
-        &self,
-        pcm: Vec<u8>,
-        cancel_on_drop: bool,
-    ) -> Result<String, String> {
         let inner = &self.inner;
         let active_asr = CredentialsVault::get_active_asr();
         let start = build_qa_asr_start(inner, &active_asr).await?;
-        let retry_guard = if cancel_on_drop {
-            Some(CancellableRetranscribeGuard::new(
-                Arc::clone(inner),
-                start.active_asr(),
-                inner.state.lock().session_id,
-            ))
-        } else {
-            None
-        };
         start.open_streaming_session().await?;
         let consumer = start.recorder_consumer();
         consumer.consume_pcm_chunk(&pcm);
         let timeout = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-        let dashscope_timeout = whisper_transcribe_timeout(
-            crate::asr::pcm::pcm_duration_ms(&pcm) as f64 / 1000.0,
-        );
-        let elevenlabs_timeout = crate::asr::elevenlabs::transcribe_timeout(
-            crate::asr::pcm::pcm_duration_ms(&pcm) as f64 / 1000.0,
-        );
         let raw = match start.active_asr() {
             ActiveAsr::Volcengine(asr) => {
                 asr.send_last_frame().await.map_err(|e| e.to_string())?;
@@ -1846,13 +1578,6 @@ impl Coordinator {
                     .map_err(|_| "重新转录超时".to_string())?
                     .map_err(|e| e.to_string())?
             }
-            ActiveAsr::Qwen3Realtime(asr) => {
-                asr.send_last_frame().await.map_err(|e| e.to_string())?;
-                tokio::time::timeout(timeout, asr.await_final_result())
-                    .await
-                    .map_err(|_| "重新转录超时".to_string())?
-                    .map_err(|e| e.to_string())?
-            }
             ActiveAsr::Whisper(w) => tokio::time::timeout(timeout, w.transcribe())
                 .await
                 .map_err(|_| "重新转录超时".to_string())?
@@ -1861,34 +1586,16 @@ impl Coordinator {
                 .await
                 .map_err(|_| "重新转录超时".to_string())?
                 .map_err(|e| e.to_string())?,
-            ActiveAsr::DashScopeMultimodal(m) => {
-                tokio::time::timeout(dashscope_timeout, m.transcribe())
+            #[cfg(target_os = "windows")]
+            ActiveAsr::FoundryLocalWhisper(local) => local
+                .transcribe(foundry_audio_transcribe_timeout_duration())
                 .await
-                .map_err(|_| "重新转录超时".to_string())?
-                .map_err(|e| e.to_string())?
-            }
-            ActiveAsr::ElevenLabs(e) => {
-                tokio::time::timeout(elevenlabs_timeout, e.transcribe())
-                    .await
-                    .map_err(|_| "重新转录超时".to_string())?
-                    .map_err(|e| e.to_string())?
-            }
+                .map_err(|e| e.to_string())?,
             #[cfg(target_os = "windows")]
-            ActiveAsr::FoundryLocalWhisper(local) => {
-                let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-                local
-                    .transcribe(windows_local_asr_transcribe_timeout(audio_secs))
-                    .await
-                    .map_err(|e| e.to_string())?
-            }
-            #[cfg(target_os = "windows")]
-            ActiveAsr::SherpaOnnxLocal(local) => {
-                let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-                local
-                    .transcribe(windows_local_asr_transcribe_timeout(audio_secs))
-                    .await
-                    .map_err(|e| e.to_string())?
-            }
+            ActiveAsr::SherpaOnnxLocal(local) => local
+                .transcribe(sherpa_audio_transcribe_timeout_duration())
+                .await
+                .map_err(|e| e.to_string())?,
             #[cfg(target_os = "macos")]
             ActiveAsr::Local(local) => {
                 let dur =
@@ -1907,9 +1614,6 @@ impl Coordinator {
                 .map_err(|_| "重新转录超时".to_string())?
                 .map_err(|e| e.to_string())?,
         };
-        if let Some(guard) = retry_guard {
-            guard.disarm();
-        }
         Ok(raw.text)
     }
 
@@ -2129,9 +1833,11 @@ pub(super) fn insert_via_non_tsf_fallback(
     let prefs = inner.prefs.get();
     let sendinput_options = dictation::windows_sendinput_options_from_prefs(&prefs);
     let status = finish_non_tsf_insertion_fallback(
-        || inner
-            .inserter
-            .insert_via_unicode_keystrokes(polished, sendinput_options),
+        || {
+            inner
+                .inserter
+                .insert_via_unicode_keystrokes(polished, sendinput_options)
+        },
         || inner.inserter.copy_fallback(polished),
     );
 
@@ -2233,8 +1939,6 @@ mod non_tsf_fallback_tests {
 
 // ─────────────────────────── helpers ───────────────────────────
 
-
-
 fn read_whisper_credentials() -> (String, String, String) {
     let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
         .ok()
@@ -2270,121 +1974,30 @@ fn read_mimo_credentials() -> (String, String, String) {
     (api_key, base_url, model)
 }
 
-fn read_elevenlabs_credentials() -> (String, String, String) {
-    let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let base_url = CredentialsVault::get(CredentialAccount::AsrEndpoint)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::elevenlabs::DEFAULT_ENDPOINT.to_string());
-    let model = CredentialsVault::get(CredentialAccount::AsrModel)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::elevenlabs::DEFAULT_MODEL.to_string());
-    (api_key, base_url, model)
-}
-
-fn read_dashscope_multimodal_credentials() -> (String, String, String) {
-    let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let base_url = if unified_bailian_is_active() {
-        let endpoint = read_asr_endpoint(crate::asr::bailian::DEFAULT_ENDPOINT);
-        derive_bailian_endpoint(&endpoint, BailianEndpointProtocol::Multimodal).unwrap_or(endpoint)
-    } else {
-        CredentialsVault::get(CredentialAccount::AsrEndpoint)
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| crate::asr::dashscope_multimodal::DEFAULT_ENDPOINT.to_string())
-    };
-    let model = CredentialsVault::get(CredentialAccount::AsrModel)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::dashscope_multimodal::DEFAULT_MODEL.to_string());
-    (api_key, base_url, model)
-}
-
-fn read_asr_vocabulary_id() -> Option<String> {
-    CredentialsVault::get(CredentialAccount::AsrVocabularyId)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-}
-
 fn read_bailian_credentials() -> BailianCredentials {
     let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
         .ok()
         .flatten()
         .unwrap_or_default();
-    let stored_endpoint = read_asr_endpoint(crate::asr::bailian::DEFAULT_ENDPOINT);
-    let endpoint = if unified_bailian_is_active() {
-        derive_bailian_endpoint(&stored_endpoint, BailianEndpointProtocol::ClassicRealtime)
-            .unwrap_or(stored_endpoint)
-    } else {
-        stored_endpoint
-    };
+    let endpoint = CredentialsVault::get(CredentialAccount::AsrEndpoint)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::asr::bailian::DEFAULT_ENDPOINT.to_string());
     let model = CredentialsVault::get(CredentialAccount::AsrModel)
         .ok()
         .flatten()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::asr::bailian::DEFAULT_MODEL.to_string());
-    let vocabulary_id = read_asr_vocabulary_id();
+    let vocabulary_id = CredentialsVault::get(CredentialAccount::AsrVocabularyId)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty());
     BailianCredentials {
         api_key,
         endpoint,
         model,
         vocabulary_id,
-    }
-}
-
-fn read_asr_endpoint(default_endpoint: &str) -> String {
-    CredentialsVault::get(CredentialAccount::AsrEndpoint)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| default_endpoint.to_string())
-}
-
-/// 统一「阿里云百炼」入口的三条协议共用同一个 `bailian` 凭据条目。存储 endpoint
-/// 提供区域/工作空间主机，运行时再按所选模型推导各协议的 scheme 与 path。
-/// 老用户停在别名 id（`bailian-qwen3-realtime` / `bailian-fun-asr-flash`）上时不触发，
-/// 仍读自己条目里存的 endpoint。
-pub(crate) fn unified_bailian_is_active() -> bool {
-    CredentialsVault::get_active_asr() == crate::asr::bailian::PROVIDER_ID
-}
-
-fn read_qwen3_realtime_credentials() -> Qwen3RealtimeCredentials {
-    let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let endpoint = if unified_bailian_is_active() {
-        let endpoint = read_asr_endpoint(crate::asr::bailian::DEFAULT_ENDPOINT);
-        derive_bailian_endpoint(&endpoint, BailianEndpointProtocol::QwenRealtime)
-            .unwrap_or(endpoint)
-    } else {
-        CredentialsVault::get(CredentialAccount::AsrEndpoint)
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| crate::asr::qwen_realtime::DEFAULT_ENDPOINT.to_string())
-    };
-    let model = CredentialsVault::get(CredentialAccount::AsrModel)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::qwen_realtime::DEFAULT_MODEL.to_string());
-    Qwen3RealtimeCredentials {
-        api_key,
-        endpoint,
-        model,
     }
 }
 
@@ -2421,7 +2034,6 @@ fn enabled_hotwords(inner: &Arc<Inner>) -> Vec<DictionaryHotword> {
         })
         .collect()
 }
-
 
 /// 读 Gemini 凭据。所有 LLM provider 共用 ark.* 槽位（persistence 没做 per-provider
 /// 隔离），所以这里也是从 `ArkApiKey` / `ArkModelId` / `ArkEndpoint` 三个槽读，
@@ -2501,40 +2113,6 @@ mod tests {
 
     fn session_id(n: u128) -> SessionId {
         Uuid::from_u128(n)
-    }
-
-    #[test]
-    fn failed_remote_pin_persistence_keeps_memory_and_server_state() {
-        let slot = Mutex::new(Some("123456".to_string()));
-        let refreshed = std::sync::atomic::AtomicBool::new(false);
-
-        let result = persist_and_commit_remote_pin(
-            &slot,
-            "654321".to_string(),
-            |_| Err("injected persistence failure".to_string()),
-            || refreshed.store(true, Ordering::SeqCst),
-        );
-
-        assert_eq!(result.unwrap_err(), "injected persistence failure");
-        assert_eq!(slot.lock().as_deref(), Some("123456"));
-        assert!(!refreshed.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn successful_remote_pin_persistence_commits_memory_before_refresh() {
-        let slot = Mutex::new(Some("123456".to_string()));
-        let observed = Mutex::new(None::<String>);
-
-        let result = persist_and_commit_remote_pin(
-            &slot,
-            "654321".to_string(),
-            |_| Ok(()),
-            || *observed.lock() = slot.lock().clone(),
-        );
-
-        assert_eq!(result.as_deref(), Ok("654321"));
-        assert_eq!(slot.lock().as_deref(), Some("654321"));
-        assert_eq!(observed.lock().as_deref(), Some("654321"));
     }
 
     #[test]
@@ -2773,10 +2351,6 @@ mod tests {
             ActiveAsrProviderKind::Bailian
         );
         assert_eq!(
-            active_asr_provider_kind(crate::asr::qwen_realtime::PROVIDER_ID),
-            ActiveAsrProviderKind::Qwen3Realtime
-        );
-        assert_eq!(
             active_asr_provider_kind("whisper"),
             ActiveAsrProviderKind::WhisperCompatible
         );
@@ -2785,132 +2359,9 @@ mod tests {
             ActiveAsrProviderKind::Mimo
         );
         assert_eq!(
-            active_asr_provider_kind(crate::asr::dashscope_multimodal::PROVIDER_ID),
-            ActiveAsrProviderKind::DashScopeMultimodal
-        );
-        assert_eq!(
-            active_asr_provider_kind(crate::asr::elevenlabs::PROVIDER_ID),
-            ActiveAsrProviderKind::ElevenLabs
-        );
-        assert_eq!(
             active_asr_provider_kind("volcengine"),
             ActiveAsrProviderKind::Volcengine
         );
-        // 未知 id 落到 Volcengine（与构建/凭据分发的兜底一致）。
-        assert_eq!(
-            active_asr_provider_kind("some-unknown-provider"),
-            ActiveAsrProviderKind::Volcengine
-        );
-    }
-
-    // 锁定分类枚举派生的凭据语义：重构把 ensure_asr_credentials /
-    // asr_configured_for_provider 从「字符串白名单 + 静默 else」改成对这两个方法的
-    // 穷尽 match，这里逐 kind 钉死映射，防止未来悄悄改动某个 provider 的凭据形态。
-    #[test]
-    fn preflight_credential_maps_every_kind() {
-        use AsrPreflightCredential::*;
-        use ActiveAsrProviderKind::*;
-        assert_eq!(Bailian.preflight_credential(), AsrApiKey);
-        assert_eq!(Qwen3Realtime.preflight_credential(), AsrApiKey);
-        assert_eq!(Mimo.preflight_credential(), AsrApiKey);
-        assert_eq!(DashScopeMultimodal.preflight_credential(), AsrApiKey);
-        assert_eq!(ElevenLabs.preflight_credential(), AsrApiKey);
-        assert_eq!(WhisperCompatible.preflight_credential(), AsrApiKey);
-        assert_eq!(Volcengine.preflight_credential(), VolcAppKey);
-    }
-
-    #[test]
-    fn resolve_effective_asr_provider_routes_bailian_by_model() {
-        let bailian = crate::asr::bailian::PROVIDER_ID;
-        // 统一百炼:按模型名路由到底层协议 id。
-        assert_eq!(
-            resolve_effective_asr_provider(bailian, "fun-asr-realtime").unwrap(),
-            crate::asr::bailian::PROVIDER_ID
-        );
-        assert_eq!(
-            resolve_effective_asr_provider(bailian, "qwen3-asr-flash-realtime").unwrap(),
-            crate::asr::qwen_realtime::PROVIDER_ID
-        );
-        assert_eq!(
-            resolve_effective_asr_provider(bailian, "qwen3-asr-flash-realtime-2026-02-10")
-                .unwrap(),
-            crate::asr::qwen_realtime::PROVIDER_ID
-        );
-        assert_eq!(
-            resolve_effective_asr_provider(bailian, "fun-asr-flash-2026-06-15").unwrap(),
-            crate::asr::dashscope_multimodal::PROVIDER_ID
-        );
-        assert_eq!(
-            resolve_effective_asr_provider(bailian, "paraformer-realtime-v2").unwrap(),
-            crate::asr::bailian::PROVIDER_ID
-        );
-        // 空模型 → 经典实时（百炼默认）；未知模型应被拒绝。
-        assert_eq!(
-            resolve_effective_asr_provider(bailian, "").unwrap(),
-            crate::asr::bailian::PROVIDER_ID
-        );
-        // 非百炼 provider 原样返回（隐藏别名与其它厂商各走各的旧路径）。
-        assert_eq!(
-            resolve_effective_asr_provider(crate::asr::qwen_realtime::PROVIDER_ID, "anything")
-                .unwrap(),
-            crate::asr::qwen_realtime::PROVIDER_ID
-        );
-        assert_eq!(
-            resolve_effective_asr_provider("whisper", "whisper-1").unwrap(),
-            "whisper"
-        );
-    }
-
-    #[test]
-    fn resolve_effective_asr_provider_rejects_unsupported_bailian_model() {
-        let error = resolve_effective_asr_provider(crate::asr::bailian::PROVIDER_ID, "paraformer-v2")
-            .unwrap_err();
-        assert!(error.contains("不支持的百炼 ASR 模型"));
-
-        let error = resolve_effective_asr_provider(
-            crate::asr::bailian::PROVIDER_ID,
-            "fun-asr-flash-8k-realtime",
-        )
-        .unwrap_err();
-        assert!(error.contains("不支持的百炼 ASR 模型"));
-    }
-
-    #[test]
-    fn derive_bailian_endpoint_preserves_region_host_and_selects_protocol_path() {
-        let endpoint = "https://workspace.ap-southeast-1.maas.aliyuncs.com/custom?x=1";
-        assert_eq!(
-            derive_bailian_endpoint(endpoint, BailianEndpointProtocol::ClassicRealtime).unwrap(),
-            "wss://workspace.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference/"
-        );
-        assert_eq!(
-            derive_bailian_endpoint(endpoint, BailianEndpointProtocol::QwenRealtime).unwrap(),
-            "wss://workspace.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime"
-        );
-        assert_eq!(
-            derive_bailian_endpoint(endpoint, BailianEndpointProtocol::Multimodal).unwrap(),
-            "https://workspace.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
-        );
-    }
-
-    #[test]
-    fn derive_bailian_endpoint_uses_protocol_default_for_empty_value() {
-        assert_eq!(
-            derive_bailian_endpoint("", BailianEndpointProtocol::QwenRealtime).unwrap(),
-            crate::asr::qwen_realtime::DEFAULT_ENDPOINT
-        );
-    }
-
-    #[test]
-    fn configured_fields_maps_every_kind() {
-        use AsrConfiguredFields::*;
-        use ActiveAsrProviderKind::*;
-        assert_eq!(Bailian.configured_fields(), ApiKeyOnly);
-        assert_eq!(Qwen3Realtime.configured_fields(), ApiKeyOnly);
-        assert_eq!(Mimo.configured_fields(), ApiKeyEndpointModel);
-        assert_eq!(DashScopeMultimodal.configured_fields(), ApiKeyEndpointModel);
-        assert_eq!(ElevenLabs.configured_fields(), ApiKeyOnly);
-        assert_eq!(WhisperCompatible.configured_fields(), EndpointModelOnly);
-        assert_eq!(Volcengine.configured_fields(), VolcAppKey);
     }
 
     #[cfg(target_os = "windows")]
@@ -2939,20 +2390,14 @@ mod tests {
         assert!(!asr_transcribe_uses_global_timeout(&active_asr));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn windows_local_asr_timeout_floors_at_global_timeout_for_short_audio() {
-        assert_eq!(
-            windows_local_asr_transcribe_timeout(5.0),
-            std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS)
-        );
-    }
+    fn foundry_audio_transcribe_timeout_is_separate_from_prepare() {
+        let timeout = foundry_audio_transcribe_timeout_duration();
 
-    #[test]
-    fn windows_local_asr_timeout_scales_with_audio_duration() {
-        // 65s 录音：65 × 1.0 = 65，+20 = 85s。长音频不再撞 30s 墙。
         assert_eq!(
-            windows_local_asr_transcribe_timeout(65.0),
-            std::time::Duration::from_secs(85)
+            timeout,
+            std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS)
         );
     }
 
@@ -3223,7 +2668,7 @@ mod tests {
             state.session_id = session_id(41);
         }
 
-        handle_pressed_edge(&coordinator.inner, std::time::Instant::now()).await;
+        handle_pressed_edge(&coordinator.inner).await;
 
         let state = coordinator.inner.state.lock();
         assert_eq!(state.phase, SessionPhase::Inserting);
@@ -3251,96 +2696,13 @@ mod tests {
             .hotkey_trigger_held
             .store(true, Ordering::SeqCst);
 
-        handle_pressed_edge(&coordinator.inner, std::time::Instant::now()).await;
+        handle_pressed_edge(&coordinator.inner).await;
 
         assert_eq!(
             coordinator.inner.state.lock().phase,
             SessionPhase::Listening
         );
         assert!(coordinator.inner.hotkey_trigger_held.load(Ordering::SeqCst));
-    }
-
-    fn set_auto_mode(coordinator: &Coordinator) {
-        coordinator
-            .inner
-            .prefs
-            .set(crate::types::UserPreferences {
-                hotkey: crate::types::HotkeyBinding {
-                    trigger: HotkeyTrigger::RightControl,
-                    mode: HotkeyMode::Auto,
-                    keys: None,
-                },
-                ..Default::default()
-            })
-            .unwrap();
-    }
-
-    // Auto 模式短按：松手时按住时长 < 阈值 → 锁存为切换态，保持 Listening（不结束会话）。
-    #[tokio::test]
-    async fn auto_short_tap_release_latches_recording() {
-        let coordinator = Coordinator::new();
-        set_auto_mode(&coordinator);
-        coordinator.inner.state.lock().phase = SessionPhase::Listening;
-        // 刚按下（elapsed ≈ 0 < 350ms）→ 短按。
-        let pressed_at = std::time::Instant::now();
-        *coordinator.inner.hotkey_press_at.lock() = Some(pressed_at);
-        coordinator
-            .inner
-            .hotkey_trigger_held
-            .store(true, Ordering::SeqCst);
-
-        handle_released_edge(&coordinator.inner, pressed_at + std::time::Duration::from_millis(100)).await;
-
-        // 短按松手不结束录音，等下一次按下再停。
-        assert_eq!(
-            coordinator.inner.state.lock().phase,
-            SessionPhase::Listening
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_short_tap_stays_latched_when_bridge_handles_release_late() {
-        let coordinator = Coordinator::new();
-        set_auto_mode(&coordinator);
-        coordinator.inner.state.lock().phase = SessionPhase::Listening;
-        let pressed_at = std::time::Instant::now();
-        *coordinator.inner.hotkey_press_at.lock() = Some(pressed_at);
-        coordinator
-            .inner
-            .hotkey_trigger_held
-            .store(true, Ordering::SeqCst);
-
-        // 模拟上一条会话阻塞 bridge：处理发生在物理松手很久之后。
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        handle_released_edge(
-            &coordinator.inner,
-            pressed_at + std::time::Duration::from_millis(100),
-        )
-        .await;
-
-        assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Listening);
-        assert!(coordinator.inner.hotkey_press_at.lock().is_none());
-    }
-
-    // Auto 模式长按：松手时按住时长 >= 阈值 → 按住说话语义，结束会话（Listening → Idle）。
-    #[tokio::test]
-    async fn auto_long_hold_release_ends_session() {
-        let coordinator = Coordinator::new();
-        set_auto_mode(&coordinator);
-        coordinator.inner.state.lock().phase = SessionPhase::Listening;
-        // 按住已超过阈值 → 长按。
-        let pressed_at = std::time::Instant::now();
-        *coordinator.inner.hotkey_press_at.lock() = Some(pressed_at);
-        coordinator
-            .inner
-            .hotkey_trigger_held
-            .store(true, Ordering::SeqCst);
-
-        handle_released_edge(&coordinator.inner, pressed_at + std::time::Duration::from_millis(500)).await;
-
-        // 无 recorder / ASR 的测试会话下，end_session 直接收尾到 Idle。
-        assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
-        assert!(coordinator.inner.hotkey_press_at.lock().is_none());
     }
 
     #[test]
@@ -3656,14 +3018,9 @@ fn enabled_phrases(inner: &Arc<Inner>) -> Vec<String> {
         .collect()
 }
 
-/// 终止态（Done / Error）后延迟 N ms 把胶囊改回 Idle，让浮窗自动消失。
-/// 点 ✓ / 中途出错走这里，保留 2 秒让用户看清结果 / 错误提示。
+/// 终止态（Done / Cancelled / Error）后延迟 N ms 把胶囊改回 Idle，让浮窗自动消失。
+/// 用户点 ✕ / ✓ / 中途出错 / 按 Esc 都走这里，统一 2 秒。
 const CAPSULE_AUTO_HIDE_DELAY_MS: u64 = 2000;
-
-/// 用户主动取消（Esc / 点 ✕）时的收起延迟。取消是明确的「我不要了」意图，
-/// 不需要像 Done/Error 那样停留 2 秒给用户读——立刻回 Idle，由前端 capsule-out
-/// 淡出动画（520ms）负责优雅收尾，观感上「按下即消失」（对齐 Typeless）。
-const CAPSULE_CANCEL_HIDE_DELAY_MS: u64 = 0;
 
 /// Toggle 模式下，end_session 将 phase 设为 Idle 后在此时间内禁止新的 begin_session。
 /// 避免用户三连按时第 3 次按下误激活新听写（此时胶囊仍在离场动画周期内）。
@@ -3675,13 +3032,9 @@ const POST_SESSION_COOLDOWN_MS: u64 = 600;
 /// 网络超时预算；只在 ASR 自身超时机制失效时作为最后的防线触发。
 const COORDINATOR_GLOBAL_TIMEOUT_SECS: u64 = 30;
 
-/// Windows 本地 batch ASR 的动态转写超时。Foundry 与 sherpa-onnx 当前使用
-/// 同一预算：短音频至少 30s，长音频按整段时长向上取整后增加 20s 余量。
-fn windows_local_asr_transcribe_timeout(audio_secs: f64) -> std::time::Duration {
-    let secs = (audio_secs.ceil() as u64)
-        .saturating_add(20)
-        .max(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-    std::time::Duration::from_secs(secs)
+#[cfg(target_os = "windows")]
+fn foundry_audio_transcribe_timeout_duration() -> std::time::Duration {
+    std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS)
 }
 
 /// 本地 Qwen3-ASR 的动态转写超时。固定 15 秒在长录音（≥ 30s）+ 慢机器
@@ -3706,6 +3059,94 @@ fn whisper_transcribe_timeout(audio_secs: f64) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// sherpa-onnx offline batch 暂与 Foundry 同档；后续按 Windows 真机 CPU/模型
+/// 实测结果再调整。
+#[cfg(target_os = "windows")]
+fn sherpa_audio_transcribe_timeout_duration() -> std::time::Duration {
+    std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS)
+}
+
+pub(crate) fn validate_llm_endpoint(raw: &str) -> anyhow::Result<()> {
+    use std::net::IpAddr;
+
+    let url =
+        url::Url::parse(raw).map_err(|e| anyhow::anyhow!("LLM endpoint 不是合法 URL：{e}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("LLM endpoint 缺少主机名"))?
+        .to_ascii_lowercase();
+
+    const METADATA_HOSTS: [&str; 2] = ["metadata.google.internal", "169.254.169.254"];
+    if METADATA_HOSTS.iter().any(|m| host.contains(m)) {
+        anyhow::bail!("LLM endpoint 指向云元数据服务，已拒绝：{host}");
+    }
+
+    let scheme = url.scheme();
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host.as_str());
+
+    let Ok(ip) = bare_host.parse::<IpAddr>() else {
+        if bare_host == "localhost" {
+            return Ok(());
+        }
+        if scheme != "https" {
+            anyhow::bail!("LLM endpoint 必须使用 https（仅 localhost / 局域网允许 http）：{raw}");
+        }
+        return Ok(());
+    };
+
+    let canonical = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+
+    let is_lan = match canonical {
+        IpAddr::V4(v4) => ip_v4_is_lan(v4),
+        IpAddr::V6(v6) => ip_v6_is_lan(v6),
+    };
+    if is_lan {
+        return Ok(());
+    }
+
+    let is_blocked = match canonical {
+        IpAddr::V4(v4) => ip_v4_is_blocked(v4),
+        IpAddr::V6(v6) => ip_v6_is_blocked(v6),
+    };
+    if is_blocked {
+        anyhow::bail!("LLM endpoint 指向保留/危险地址，已拒绝（防 SSRF）：{ip}");
+    }
+
+    if scheme != "https" {
+        anyhow::bail!("LLM endpoint 必须使用 https（仅 localhost / 局域网允许 http）：{raw}");
+    }
+
+    Ok(())
+}
+
+fn ip_v4_is_lan(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_private()
+}
+
+fn ip_v4_is_blocked(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let is_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || is_cgnat
+}
+
+fn ip_v6_is_lan(ip: std::net::Ipv6Addr) -> bool {
+    let segs = ip.segments();
+    let is_ula = (segs[0] & 0xfe00) == 0xfc00;
+    ip.is_loopback() || is_ula
+}
+
+fn ip_v6_is_blocked(ip: std::net::Ipv6Addr) -> bool {
+    let segs = ip.segments();
+    let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+    ip.is_unspecified() || is_link_local
+}
+
 /// 检查 begin_session 的 await 间隙是否被 cancel_session 打断。
 /// 必须在持有 state lock 的瞬间读，结果一拿就过期，所以用 helper 名字提醒只在
 /// 「准备做下一步副作用前」用。
@@ -3728,16 +3169,16 @@ fn schedule_capsule_idle(inner: &Arc<Inner>, delay_ms: u64) {
     let inner_clone = Arc::clone(inner);
     async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        // 必须 dictation **和** QA 同时空闲才能隐藏胶囊。否则旧 dictation Done timer
-        // 的尾巴会在新 QA 录音/思考中把胶囊意外收掉（issue #118 v2 复现）。
+        // 必须录音车道、后台处理队列和 QA 同时空闲才能隐藏胶囊。否则上一条
+        // dictation Done timer 会在下一条录音或队列处理期间把胶囊意外收掉。
         let dictation_idle = inner_clone.state.lock().phase == SessionPhase::Idle;
+        let processing_idle = inner_clone.processing_queue.lock().is_idle();
         let qa_idle = inner_clone.qa_state.lock().phase == QaPhase::Idle;
-        if dictation_idle && qa_idle {
+        if dictation_idle && processing_idle && qa_idle {
             emit_capsule(&inner_clone, CapsuleState::Idle, 0.0, 0, None, None);
         }
     });
 }
-
 
 // ─────────────────────────── audio bridge ───────────────────────────
 

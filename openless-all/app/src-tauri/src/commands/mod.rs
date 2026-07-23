@@ -56,8 +56,7 @@ pub(crate) use crate::recorder::{AudioConsumer, Recorder};
 #[cfg(not(mobile))]
 pub(crate) use crate::types::WindowsImeStatus;
 pub(crate) use crate::types::{
-    builtin_style_pack_id, default_active_style_pack_id, ActivityDay,
-    AndroidAccessibilityStatus,
+    builtin_style_pack_id, default_active_style_pack_id, ActivityDay, AndroidAccessibilityStatus,
     AndroidOverlayStatus, ChineseScriptPreference, ComboBinding, CorrectionRule, CredentialsStatus,
     DictationSession, DictionaryEntry, HotkeyCapability, HotkeyStatus, OutputLanguagePreference,
     PolishMode, ShortcutBinding, StylePack, StylePackKind, StylePackRuntimeDiagnostics,
@@ -1278,57 +1277,6 @@ mod tests {
             "https://github.com/appergb/openless/releases/tag/v1.2.24-2-beta-tauri"
         );
         assert_eq!(got.published_at, "2026-05-08T01:27:23Z");
-    }
-
-    #[test]
-    fn parse_latest_beta_from_atom_prefers_modern_beta_tag_over_legacy_beta() {
-        let body = r#"<?xml version="1.0"?>
-<feed>
-  <entry>
-    <updated>2026-07-15T08:00:00Z</updated>
-    <link rel="alternate" type="text/html" href="https://github.com/appergb/openless/releases/tag/v1.3.15-tauri"/>
-  </entry>
-  <entry>
-    <updated>2026-07-15T07:00:00Z</updated>
-    <link rel="alternate" type="text/html" href="https://github.com/appergb/openless/releases/tag/v1.3.15-Beta.1-tauri"/>
-  </entry>
-  <entry>
-    <updated>2026-06-17T15:41:46Z</updated>
-    <link rel="alternate" type="text/html" href="https://github.com/appergb/openless/releases/tag/v1.3.10-4-beta-tauri"/>
-  </entry>
-</feed>"#;
-
-        let got = parse_latest_beta_from_atom(body).expect("must find the newest Beta entry");
-
-        assert_eq!(got.tag_name, "v1.3.15-Beta.1-tauri");
-        assert_eq!(got.published_at, "2026-07-15T07:00:00Z");
-    }
-
-    #[test]
-    fn parse_latest_beta_from_atom_skips_malformed_modern_tags() {
-        let body = r#"<feed>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v-Beta.1-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/garbage-Beta.1-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/1.3.15-Beta.1-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1.3-Beta.1-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1.3.15.0-Beta.1-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1..15-Beta.1-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1.3.x-Beta.1-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1.3.15-Beta.-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1.3.15-Beta.x-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1.3.15-Beta.1-extra-tauri"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1.3.15-Beta.1-tauri-extra"/></entry>
-  <entry><link href="https://github.com/appergb/openless/releases/tag/v1.3.15-Beta.2-Beta.1-tauri"/></entry>
-  <entry>
-    <updated>2026-07-15T07:00:00Z</updated>
-    <link href="https://github.com/appergb/openless/releases/tag/v1.3.15-Beta.1-tauri"/>
-  </entry>
-</feed>"#;
-
-        let got = parse_latest_beta_from_atom(body).expect("must skip malformed Beta tags");
-
-        assert_eq!(got.tag_name, "v1.3.15-Beta.1-tauri");
-        assert_eq!(got.published_at, "2026-07-15T07:00:00Z");
     }
 
     #[test]

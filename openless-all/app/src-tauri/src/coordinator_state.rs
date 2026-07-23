@@ -4,6 +4,7 @@
 //! 状态机。这样 Windows CI 可以在不启动完整 Tauri test harness 的情况下实际运行
 //! 后端单测。
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use uuid::Uuid;
@@ -181,34 +182,91 @@ pub(crate) fn finish_cancel_session_state(state: &mut SessionState, decision: Ca
     }
 }
 
-/// 完成已进入 Processing 的取消收尾。
-///
-/// cancel_session 不能直接把 Processing 改成 Idle，否则会和 end_session 的润色/插入
-/// 收尾并发竞争；因此由 end_session 在取消早退点调用。session id 校验避免旧会话的迟到
-/// continuation 修改新会话状态。
-pub(crate) fn finish_cancelled_processing_state(
-    state: &mut SessionState,
-    session_id: SessionId,
-) -> bool {
-    if state.session_id != session_id || !state.cancelled {
-        return false;
-    }
-    if state.phase == SessionPhase::Processing {
-        state.phase = SessionPhase::Idle;
-    }
-    if state.phase != SessionPhase::Idle {
-        return false;
-    }
-    state.focus_target = None;
-    true
-}
-
 pub(crate) fn start_processing_if_listening(state: &mut SessionState) -> Option<SessionId> {
     if state.phase != SessionPhase::Listening {
         return None;
     }
     state.phase = SessionPhase::Processing;
     Some(state.session_id)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FinishedCaptureState {
+    pub(crate) session_id: SessionId,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) focus_target: Option<usize>,
+    pub(crate) front_app: Option<String>,
+    pub(crate) voice_agent: bool,
+}
+
+/// Detach a completed recording from the capture lane.
+///
+/// The returned snapshot belongs to the background processing queue; the live
+/// state immediately returns to Idle so a new hotkey press can start recording
+/// while the previous item is still being transcribed or polished.
+pub(crate) fn finish_capture_for_processing_state(
+    state: &mut SessionState,
+) -> Option<FinishedCaptureState> {
+    if state.phase != SessionPhase::Listening {
+        return None;
+    }
+    let capture = FinishedCaptureState {
+        session_id: state.session_id,
+        elapsed_ms: state.started_at.elapsed().as_millis() as u64,
+        focus_target: state.focus_target.take(),
+        front_app: state.front_app.clone(),
+        voice_agent: state.voice_agent,
+    };
+    state.phase = SessionPhase::Idle;
+    state.pending_stop = false;
+    Some(capture)
+}
+
+pub(crate) struct OrderedProcessingQueue<T> {
+    pending: VecDeque<T>,
+    worker_running: bool,
+}
+
+impl<T> Default for OrderedProcessingQueue<T> {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            worker_running: false,
+        }
+    }
+}
+
+impl<T> OrderedProcessingQueue<T> {
+    /// Returns true only for the enqueue operation that must start the worker.
+    pub(crate) fn enqueue(&mut self, item: T) -> bool {
+        self.pending.push_back(item);
+        if self.worker_running {
+            false
+        } else {
+            self.worker_running = true;
+            true
+        }
+    }
+
+    /// Pops in capture order. Observing an empty queue atomically retires the
+    /// worker under the same mutex used by enqueue, avoiding a lost-wakeup race.
+    pub(crate) fn pop_next(&mut self) -> Option<T> {
+        match self.pending.pop_front() {
+            Some(item) => Some(item),
+            None => {
+                self.worker_running = false;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.worker_running && self.pending.is_empty()
+    }
 }
 
 pub(crate) struct RecordingAbort {
@@ -428,42 +486,6 @@ mod tests {
     }
 
     #[test]
-    fn finish_cancelled_processing_state_returns_idle_for_matching_session() {
-        let mut state = SessionState {
-            phase: SessionPhase::Processing,
-            cancelled: true,
-            focus_target: Some(1),
-            session_id: session_id(42),
-            ..Default::default()
-        };
-
-        assert!(finish_cancelled_processing_state(
-            &mut state,
-            session_id(42)
-        ));
-        assert_eq!(state.phase, SessionPhase::Idle);
-        assert!(state.focus_target.is_none());
-    }
-
-    #[test]
-    fn finish_cancelled_processing_state_rejects_stale_session() {
-        let mut state = SessionState {
-            phase: SessionPhase::Processing,
-            cancelled: true,
-            focus_target: Some(1),
-            session_id: session_id(42),
-            ..Default::default()
-        };
-
-        assert!(!finish_cancelled_processing_state(
-            &mut state,
-            session_id(41)
-        ));
-        assert_eq!(state.phase, SessionPhase::Processing);
-        assert_eq!(state.focus_target, Some(1));
-    }
-
-    #[test]
     fn stop_dictation_from_listening_enters_processing_once() {
         let mut state = SessionState {
             phase: SessionPhase::Listening,
@@ -478,6 +500,42 @@ mod tests {
         assert_eq!(state.phase, SessionPhase::Processing);
         assert_eq!(start_processing_if_listening(&mut state), None);
         assert_eq!(state.phase, SessionPhase::Processing);
+    }
+
+    #[test]
+    fn finishing_capture_releases_recording_lane_before_background_processing() {
+        let mut state = SessionState {
+            phase: SessionPhase::Listening,
+            focus_target: Some(17),
+            session_id: session_id(42),
+            front_app: Some("Terminal".to_string()),
+            voice_agent: false,
+            ..Default::default()
+        };
+
+        let capture = finish_capture_for_processing_state(&mut state).unwrap();
+
+        assert_eq!(state.phase, SessionPhase::Idle);
+        assert!(state.focus_target.is_none());
+        assert_eq!(capture.session_id, session_id(42));
+        assert_eq!(capture.focus_target, Some(17));
+        assert_eq!(capture.front_app.as_deref(), Some("Terminal"));
+        assert!(!capture.voice_agent);
+    }
+
+    #[test]
+    fn ordered_processing_queue_has_one_worker_and_preserves_capture_order() {
+        let mut queue = OrderedProcessingQueue::default();
+
+        assert!(queue.enqueue(1));
+        assert!(!queue.enqueue(2));
+        assert!(!queue.enqueue(3));
+        assert_eq!(queue.pop_next(), Some(1));
+        assert_eq!(queue.pop_next(), Some(2));
+        assert_eq!(queue.pop_next(), Some(3));
+        assert_eq!(queue.pop_next(), None);
+        assert!(queue.enqueue(4));
+        assert_eq!(queue.pop_next(), Some(4));
     }
 
     #[test]

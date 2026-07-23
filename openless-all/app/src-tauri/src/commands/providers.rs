@@ -27,67 +27,14 @@ pub async fn validate_provider_credentials(kind: String) -> Result<ProviderCheck
 
 #[tauri::command]
 pub async fn list_provider_models(kind: String) -> Result<ProviderModelsResult, String> {
-    if kind == "asr"
-        && CredentialsVault::get_active_asr() == crate::asr::bailian::PROVIDER_ID
-        && !cfg!(mobile)
-    {
-        // 统一「阿里云百炼」入口:三条协议(实时 fun-asr-realtime / 实时 qwen3 /
-        // 录音文件 fun-asr-flash)收成一个 provider。百炼各网关都没有模型列表 HTTP
-        // 接口,列表是静态的;但先跑一次与「验证」相同的、按当前所选模型对应协议的
-        // 连通性检查(validate_asr_provider 已按模型路由),避免 Key/endpoint 全错时
-        // 也显示成功。随后返回三个可选模型供下拉。
-        validate_asr_provider().await?;
-        // 静态清单只是常用快捷项；协议按模型名自动路由，用户也可在模型框直接手填
-        // 已支持的 DashScope ASR 模型；不支持的模型会在验证/开始录音前明确拒绝。
-        return Ok(ProviderModelsResult {
-            models: vec![
-                crate::asr::bailian::DEFAULT_MODEL.to_string(),
-                crate::asr::qwen_realtime::DEFAULT_MODEL.to_string(),
-                "qwen3-asr-flash-realtime-2026-02-10".to_string(),
-                "qwen3-asr-flash-realtime-2025-10-27".to_string(),
-                crate::asr::dashscope_multimodal::DEFAULT_MODEL.to_string(),
-            ],
-        });
-    }
-    if kind == "asr"
-        && CredentialsVault::get_active_asr() == crate::asr::bailian::PROVIDER_ID
-        && cfg!(mobile)
-    {
-        validate_bailian_asr_provider().await?;
+    if kind == "asr" && CredentialsVault::get_active_asr() == crate::asr::bailian::PROVIDER_ID {
         return Ok(ProviderModelsResult {
             models: vec![crate::asr::bailian::DEFAULT_MODEL.to_string()],
-        });
-    }
-    if kind == "asr" && CredentialsVault::get_active_asr() == crate::asr::qwen_realtime::PROVIDER_ID
-    {
-        // 与 bailian 同理：Realtime 网关无模型列表接口，先做真实连通性检查，
-        // 列表为官方文档在案的稳定别名 + 快照版本。
-        validate_qwen3_realtime_asr_provider().await?;
-        return Ok(ProviderModelsResult {
-            models: vec![
-                crate::asr::qwen_realtime::DEFAULT_MODEL.to_string(),
-                "qwen3-asr-flash-realtime-2026-02-10".to_string(),
-                "qwen3-asr-flash-realtime-2025-10-27".to_string(),
-            ],
         });
     }
     if kind == "asr" && CredentialsVault::get_active_asr() == crate::asr::mimo::PROVIDER_ID {
         return Ok(ProviderModelsResult {
             models: vec![crate::asr::mimo::DEFAULT_MODEL.to_string()],
-        });
-    }
-    if kind == "asr"
-        && CredentialsVault::get_active_asr() == crate::asr::dashscope_multimodal::PROVIDER_ID
-    {
-        // multimodal-generation 无模型列表 HTTP 接口；与 mimo 同，返回静态别名。
-        return Ok(ProviderModelsResult {
-            models: vec![crate::asr::dashscope_multimodal::DEFAULT_MODEL.to_string()],
-        });
-    }
-    if kind == "asr" && CredentialsVault::get_active_asr() == crate::asr::elevenlabs::PROVIDER_ID {
-        validate_elevenlabs_asr_provider().await?;
-        return Ok(ProviderModelsResult {
-            models: vec![crate::asr::elevenlabs::DEFAULT_MODEL.to_string()],
         });
     }
     if kind == "llm" && CredentialsVault::get_active_llm() == CODEX_OAUTH_PROVIDER_ID {
@@ -148,7 +95,7 @@ fn read_openai_provider_config(kind: &str) -> Result<ProviderConfig, String> {
     // 校验，拒绝指向内网/回环/link-local/CGNAT/IPv6 ULA/元数据服务的地址；localhost/
     // 127.0.0.1/::1 仍放行 http（本地 Whisper 服务）。覆盖 validate_provider_credentials
     // (asr/llm) 连通性测试与 list_provider_models 模型列表两条 HTTP 路径。
-    crate::endpoint_security::validate_http_endpoint(&base_url)
+    crate::coordinator::validate_llm_endpoint(&base_url)
         .map_err(|_| "endpointInvalid".to_string())?;
     Ok(ProviderConfig {
         base_url,
@@ -184,7 +131,12 @@ async fn validate_llm_provider() -> Result<(), String> {
             )
             .await
             .map(|_| ())
-            .map_err(provider_llm_error_message);
+            .map_err(|e| match e {
+                LLMError::InvalidResponse { status, .. } => {
+                    format!("providerHttpStatus:{status}")
+                }
+                other => other.to_string(),
+            });
     }
 
     let config = read_openai_provider_config("llm")?;
@@ -218,18 +170,12 @@ async fn validate_llm_provider() -> Result<(), String> {
         )
         .await
         .map(|_| ())
-        .map_err(provider_llm_error_message)
-}
-
-fn provider_llm_error_message(error: LLMError) -> String {
-    match error {
-        LLMError::InvalidResponse { status, .. } => format!("providerHttpStatus:{status}"),
-        LLMError::Timeout => "请求超时".to_string(),
-        LLMError::Network(_) => "网络请求失败".to_string(),
-        LLMError::MissingCredentials => "providerCredentialsMissing".to_string(),
-        LLMError::ParseError(_) => "providerInvalidResponse".to_string(),
-        LLMError::CodexAuth(_) => "codexOAuthUnavailable".to_string(),
-    }
+        .map_err(|e| match e {
+            LLMError::InvalidResponse { status, .. } => {
+                format!("providerHttpStatus:{status}")
+            }
+            other => other.to_string(),
+        })
 }
 
 async fn validate_asr_provider() -> Result<(), String> {
@@ -239,36 +185,10 @@ async fn validate_asr_provider() -> Result<(), String> {
     }
 
     if active_asr == crate::asr::bailian::PROVIDER_ID {
-        // 统一百炼:按所选模型验证对应协议（endpoint 由前端按模型同步，各 validator
-        // 读到的都是该协议的正确地址）。
-        let model = CredentialsVault::get(CredentialAccount::AsrModel)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let effective = crate::coordinator::resolve_effective_asr_provider(&active_asr, &model)?;
-        if effective == crate::asr::qwen_realtime::PROVIDER_ID {
-            return validate_qwen3_realtime_asr_provider().await;
-        }
-        if effective == crate::asr::dashscope_multimodal::PROVIDER_ID {
-            return validate_dashscope_multimodal_asr_provider().await;
-        }
         return validate_bailian_asr_provider().await;
-    }
-    if active_asr == crate::asr::qwen_realtime::PROVIDER_ID {
-        return validate_qwen3_realtime_asr_provider().await;
     }
     if active_asr == crate::asr::mimo::PROVIDER_ID {
         return validate_mimo_asr_provider().await;
-    }
-    if active_asr == crate::asr::dashscope_multimodal::PROVIDER_ID {
-        let model = CredentialsVault::get(CredentialAccount::AsrModel)
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
-        crate::coordinator::validate_dashscope_multimodal_model(&model)?;
-        return validate_dashscope_multimodal_asr_provider().await;
-    }
-    if active_asr == crate::asr::elevenlabs::PROVIDER_ID {
-        return validate_elevenlabs_asr_provider().await;
     }
 
     let config = read_openai_provider_config("asr")?;
@@ -296,106 +216,6 @@ async fn validate_mimo_asr_provider() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-async fn validate_elevenlabs_asr_provider() -> Result<(), String> {
-    let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
-        .map_err(|e| e.to_string())?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "API Key 为空".to_string())?;
-    let base_url = CredentialsVault::get(CredentialAccount::AsrEndpoint)
-        .map_err(|e| e.to_string())?
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::elevenlabs::DEFAULT_ENDPOINT.to_string());
-    crate::endpoint_security::validate_http_endpoint(&base_url)
-        .map_err(|_| "endpointInvalid".to_string())?;
-    let model = CredentialsVault::get(CredentialAccount::AsrModel)
-        .map_err(|e| e.to_string())?
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::elevenlabs::DEFAULT_MODEL.to_string());
-    let asr = crate::asr::ElevenLabsBatchASR::new(api_key, base_url, model);
-    crate::recorder::AudioConsumer::consume_pcm_chunk(
-        &asr,
-        &encode_wav_16k_mono_silence(250)[44..],
-    );
-    asr.transcribe().await.map(|_| ()).map_err(|error| {
-        if error.chain().any(|cause| {
-            cause
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(reqwest::Error::is_timeout)
-        }) {
-            "providerRequestTimeout".to_string()
-        } else {
-            error.to_string()
-        }
-    })
-}
-
-/// fun-asr-flash 官方公开示例音频，用于连通性校验。该模型对纯静音会返回
-/// 400（"no speech" 类错误），无法像 Whisper/Mimo 那样发静音探活；改用这段
-/// 阿里官方文档在案的示例 wav（由 DashScope 侧拉取），key/endpoint/model 有效
-/// 即返回 200。
-const DASHSCOPE_ASR_VALIDATE_SAMPLE_URL: &str =
-    "https://dashscope.oss-cn-beijing.aliyuncs.com/samples/audio/paraformer/hello_world_female2.wav";
-
-async fn validate_dashscope_multimodal_asr_provider() -> Result<(), String> {
-    // 统一百炼复用配置中的区域/工作空间主机，并推导 multimodal 的 https 路径。
-    // 隐藏别名仍按原有完整 endpoint 读取。
-    let (api_key, base_url) = if crate::coordinator::unified_bailian_is_active() {
-        let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
-            .map_err(|e| e.to_string())?
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| "API Key 为空".to_string())?;
-        let endpoint = CredentialsVault::get(CredentialAccount::AsrEndpoint)
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
-        let endpoint = crate::coordinator::derive_bailian_endpoint(
-            &endpoint,
-            crate::coordinator::BailianEndpointProtocol::Multimodal,
-        )?;
-        (api_key, endpoint)
-    } else {
-        let config = read_openai_provider_config("asr")?;
-        (config.api_key, config.base_url)
-    };
-    let model = CredentialsVault::get(CredentialAccount::AsrModel)
-        .map_err(|e| e.to_string())?
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::dashscope_multimodal::DEFAULT_MODEL.to_string());
-    crate::coordinator::validate_dashscope_multimodal_model(&model)?;
-    let url = crate::asr::dashscope_multimodal::generation_url(&base_url)
-        .map_err(|_| "endpointInvalid".to_string())?;
-    let body = serde_json::json!({
-        "model": model,
-        "input": { "messages": [{ "role": "user", "content": [{
-            "type": "input_audio",
-            "input_audio": { "data": DASHSCOPE_ASR_VALIDATE_SAMPLE_URL },
-        }]}]},
-        "parameters": { "format": "wav", "sample_rate": "16000" },
-    });
-    let client = http_client_builder(&url, 20)
-        .build()
-        .map_err(|_| "providerClientInitFailed".to_string())?;
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .header("X-DashScope-SSE", "disable")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "providerRequestTimeout".to_string()
-            } else {
-                "providerNetworkError".to_string()
-            }
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("providerHttpStatus:{}", status.as_u16()));
-    }
-    Ok(())
-}
-
 async fn validate_bailian_asr_provider() -> Result<(), String> {
     let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
         .map_err(|e| e.to_string())?
@@ -404,25 +224,11 @@ async fn validate_bailian_asr_provider() -> Result<(), String> {
         return Err("API Key 为空".to_string());
     }
     // 已知残留（issue #609 F-01 孪生 gap）：Bailian endpoint 走 `wss://`，与 http/https-only 的
-    // validate_http_endpoint 不兼容，无法直接复用，需单独的 ws/wss 感知 SSRF 校验器（超本次范围）。
-    let stored_endpoint = CredentialsVault::get(CredentialAccount::AsrEndpoint)
+    // validate_llm_endpoint 不兼容，无法直接复用，需单独的 ws/wss 感知 SSRF 校验器（超本次范围）。
+    let endpoint = CredentialsVault::get(CredentialAccount::AsrEndpoint)
         .map_err(|e| e.to_string())?
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::asr::bailian::DEFAULT_ENDPOINT.to_string());
-    let endpoint = if crate::coordinator::unified_bailian_is_active() {
-        crate::coordinator::derive_bailian_endpoint(
-            &stored_endpoint,
-            crate::coordinator::BailianEndpointProtocol::ClassicRealtime,
-        )?
-    } else {
-        stored_endpoint
-    };
-    // 协议头先行校验：填成 https://（百炼兼容模式 / 专属域名地址）时，WebSocket
-    // 握手报的 "URL scheme not supported" 会被前端兜底成笼统的「操作失败」，
-    // 用户无从定位。这里拦下并返回专用错误码，前端映射成可操作的提示。
-    if !crate::asr::bailian::endpoint_scheme_is_websocket(&endpoint) {
-        return Err("bailianEndpointSchemeInvalid".to_string());
-    }
     let model = CredentialsVault::get(CredentialAccount::AsrModel)
         .map_err(|e| e.to_string())?
         .filter(|s| !s.trim().is_empty())
@@ -439,62 +245,9 @@ async fn validate_bailian_asr_provider() -> Result<(), String> {
         },
     ));
     asr.open_session().await.map_err(|e| e.to_string())?;
-    // 验证音频必须 ≥200ms：只发 1 个 100ms 静音块时 DashScope 必然返回
-    // task-failed: EmptyAudio，导致有效凭据也永远验证失败（2026-07 实测边界：
-    // 100ms 拒、200ms 起收）。取 500ms 留余量，与 Mimo 验证的 250ms 同量级。
     crate::asr::AudioConsumer::consume_pcm_chunk(
         &*asr,
-        &vec![0u8; crate::asr::bailian::TARGET_AUDIO_CHUNK_BYTES * 5],
-    );
-    asr.send_last_frame().await.map_err(|e| e.to_string())?;
-    asr.await_final_result()
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
-async fn validate_qwen3_realtime_asr_provider() -> Result<(), String> {
-    let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    if api_key.trim().is_empty() {
-        return Err("API Key 为空".to_string());
-    }
-    // 统一百炼保留配置中的区域/工作空间主机，并切换到 Qwen Realtime 路径。
-    let endpoint = if crate::coordinator::unified_bailian_is_active() {
-        let endpoint = CredentialsVault::get(CredentialAccount::AsrEndpoint)
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
-        crate::coordinator::derive_bailian_endpoint(
-            &endpoint,
-            crate::coordinator::BailianEndpointProtocol::QwenRealtime,
-        )?
-    } else {
-        CredentialsVault::get(CredentialAccount::AsrEndpoint)
-            .map_err(|e| e.to_string())?
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| crate::asr::qwen_realtime::DEFAULT_ENDPOINT.to_string())
-    };
-    if !crate::asr::qwen_realtime::endpoint_scheme_is_secure_websocket(&endpoint) {
-        return Err("qwen3EndpointSchemeInvalid".to_string());
-    }
-    let model = CredentialsVault::get(CredentialAccount::AsrModel)
-        .map_err(|e| e.to_string())?
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::qwen_realtime::DEFAULT_MODEL.to_string());
-    let asr = std::sync::Arc::new(crate::asr::Qwen3RealtimeASR::new(
-        crate::asr::Qwen3RealtimeCredentials {
-            api_key,
-            endpoint,
-            model,
-        },
-    ));
-    asr.open_session().await.map_err(|e| e.to_string())?;
-    // Realtime 协议对纯静音 + finish 干净返回 session.finished（2026-07 实测），
-    // 无经典协议 <200ms 必报 EmptyAudio 的问题；发 500ms 与 bailian 验证对齐。
-    crate::asr::AudioConsumer::consume_pcm_chunk(
-        &*asr,
-        &vec![0u8; crate::asr::qwen_realtime::TARGET_AUDIO_CHUNK_BYTES * 5],
+        &vec![0u8; crate::asr::bailian::TARGET_AUDIO_CHUNK_BYTES],
     );
     asr.send_last_frame().await.map_err(|e| e.to_string())?;
     asr.await_final_result()
@@ -661,50 +414,13 @@ fn encode_wav_16k_mono_silence(duration_ms: u32) -> Vec<u8> {
     wav
 }
 
-fn sanitized_provider_destination(raw_url: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse(raw_url.trim()) else {
-        return "<invalid-provider-url>".to_string();
-    };
-    if !matches!(url.scheme(), "http" | "https")
-        || url.set_username("").is_err()
-        || url.set_password(None).is_err()
-    {
-        return "<invalid-provider-url>".to_string();
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    url.to_string()
-}
-
-fn provider_log_context(raw_url: &str, is_gemini: bool) -> String {
-    format!(
-        "GET {} (gemini={is_gemini})",
-        sanitized_provider_destination(raw_url)
-    )
-}
-
-fn provider_request_error_message(error: &reqwest::Error) -> &'static str {
-    if error.is_timeout() {
-        "请求超时"
-    } else if error.is_connect() {
-        "网络连接失败"
-    } else {
-        "网络请求失败"
-    }
-}
-
 pub(crate) async fn fetch_provider_models(config: &ProviderConfig) -> Result<Vec<String>, String> {
     let url = models_url(&config.base_url);
     let is_gemini = is_gemini_base_url(&config.base_url);
-    let log_context = provider_log_context(&url, is_gemini);
-    log::info!("[provider-check] {log_context}");
+    log::info!("[provider-check] GET {url} (gemini={is_gemini})");
     let client = http_client_builder(&config.base_url, 15)
         .build()
-        .map_err(|_| {
-            log::warn!("[provider-check] {log_context} failed: client-init");
-            "HTTP client 初始化失败".to_string()
-        })?;
-    // Observability uses only the sanitized copy above; requests retain the original URL.
+        .map_err(|e| format!("HTTP client 初始化失败: {e}"))?;
     let mut request = client.get(&url);
     if !config.api_key.trim().is_empty() {
         // 谷歌原生 generativelanguage.googleapis.com 不识别 Bearer Authorization,
@@ -718,21 +434,18 @@ pub(crate) async fn fetch_provider_models(config: &ProviderConfig) -> Result<Vec
     for (k, v) in &config.extra_headers {
         request = request.header(k.as_str(), v.as_str());
     }
-    let response = request.send().await.map_err(|error| {
-        let message = provider_request_error_message(&error);
-        log::warn!("[provider-check] {log_context} failed: {message}");
-        message.to_string()
+    let response = request.send().await.map_err(|e| {
+        if e.is_timeout() {
+            "请求超时".to_string()
+        } else {
+            format!("网络错误: {e}")
+        }
     })?;
     let status = response.status();
-    let body = response.text().await.map_err(|error| {
-        let reason = if error.is_timeout() {
-            "response-timeout"
-        } else {
-            "response-read"
-        };
-        log::warn!("[provider-check] {log_context} failed: {reason}");
-        "读取响应失败".to_string()
-    })?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("读取响应失败: {e}"))?;
     if !status.is_success() {
         return Err(format!("providerHttpStatus:{}", status.as_u16()));
     }
@@ -748,21 +461,14 @@ pub(crate) fn is_gemini_base_url(base_url: &str) -> bool {
 }
 
 pub(crate) fn models_url(base_url: &str) -> String {
-    let trimmed = base_url.trim();
-    let Ok(mut url) = reqwest::Url::parse(trimmed) else {
-        let fallback = trimmed.trim_end_matches('/');
-        return format!("{fallback}/models");
-    };
-    let path = url.path().trim_end_matches('/');
-    let next_path = if path.ends_with("/models") {
-        path.to_string()
-    } else if let Some(prefix) = path.strip_suffix("/chat/completions") {
-        format!("{prefix}/models")
-    } else {
-        format!("{path}/models")
-    };
-    url.set_path(&next_path);
-    url.to_string()
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/models") {
+        return trimmed.to_string();
+    }
+    if let Some(prefix) = trimmed.strip_suffix("/chat/completions") {
+        return format!("{prefix}/models");
+    }
+    format!("{trimmed}/models")
 }
 
 pub(crate) fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
@@ -835,206 +541,29 @@ mod tests {
     // API Key 发请求，read_openai_provider_config（连通性测试 + 模型列表 chokepoint）现在复用
     // LLM 路径的 SSRF 校验。read_openai_provider_config 依赖凭据库无法纯单测，这里直接对它调用
     // 的校验器锁定 ASR 形态 endpoint 的拒绝/放行契约。
-    use super::{
-        fetch_provider_models, models_url, provider_llm_error_message, provider_log_context,
-        provider_request_error_message, sanitized_provider_destination, ProviderConfig,
-    };
-    use crate::endpoint_security::validate_http_endpoint;
-
-    #[test]
-    fn provider_destination_redacts_userinfo_query_and_fragment() {
-        let raw = "https://alice:password@example.com:8443/v1/models?api_key=query-secret#private-fragment";
-        let destination = sanitized_provider_destination(raw);
-
-        assert_eq!(destination, "https://example.com:8443/v1/models");
-        for secret in [
-            "alice",
-            "password",
-            "api_key",
-            "query-secret",
-            "private-fragment",
-        ] {
-            assert!(!destination.contains(secret), "destination leaked {secret}");
-        }
-    }
-
-    #[test]
-    fn provider_destination_preserves_normal_origin_path_and_port() {
-        assert_eq!(
-            sanitized_provider_destination("https://api.example.com:9443/v1/models"),
-            "https://api.example.com:9443/v1/models"
-        );
-    }
-
-    #[test]
-    fn provider_destination_never_echoes_malformed_input() {
-        let raw = "not a url?token=malformed-secret#private";
-        let destination = sanitized_provider_destination(raw);
-
-        assert_eq!(destination, "<invalid-provider-url>");
-        assert!(!destination.contains("malformed-secret"));
-        assert!(!provider_log_context(raw, false).contains("malformed-secret"));
-    }
-
-    #[test]
-    fn provider_log_context_contains_only_the_sanitized_destination() {
-        let context = provider_log_context(
-            "https://user:pass@example.com/v1/models?token=query-secret#fragment-secret",
-            true,
-        );
-
-        assert_eq!(context, "GET https://example.com/v1/models (gemini=true)");
-        for secret in ["user", "pass", "query-secret", "fragment-secret"] {
-            assert!(!context.contains(secret), "log context leaked {secret}");
-        }
-    }
-
-    #[test]
-    fn provider_validation_ipc_error_never_includes_network_details() {
-        let secret = "https://user:pass@example.com/v1?token=query-secret#fragment";
-        let message = provider_llm_error_message(crate::polish::LLMError::Network(format!(
-            "request failed for {secret}"
-        )));
-        assert_eq!(message, "网络请求失败");
-        assert!(!message.contains(secret));
-    }
-
-    #[tokio::test]
-    async fn provider_request_error_does_not_echo_reqwest_url_secrets() {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let raw =
-            format!("http://user:password@{addr}/v1/models?token=query-secret#fragment-secret");
-        let error = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .get(&raw)
-            .send()
-            .await
-            .expect_err("closed listener should reject the request");
-        let message = provider_request_error_message(&error);
-
-        assert_eq!(message, "网络连接失败");
-        for secret in ["user", "password", "query-secret", "fragment-secret"] {
-            assert!(!message.contains(secret), "IPC error leaked {secret}");
-        }
-    }
-
-    #[tokio::test]
-    async fn fetch_provider_models_keeps_url_secrets_out_of_ipc_errors() {
-        use std::collections::HashMap;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let secrets = ["user", "password", "query-secret", "fragment-secret"];
-        let error = fetch_provider_models(&ProviderConfig {
-            base_url: format!(
-                "http://{}:{}@{addr}/v1?token={}#{}",
-                secrets[0], secrets[1], secrets[2], secrets[3]
-            ),
-            api_key: String::new(),
-            extra_headers: HashMap::new(),
-        })
-        .await
-        .expect_err("closed listener should reject the provider request");
-
-        assert_eq!(error, "网络连接失败");
-        for secret in secrets {
-            assert!(!error.contains(secret), "IPC error leaked {secret}");
-        }
-    }
-
-    #[test]
-    fn models_url_appends_to_the_path_without_corrupting_query_or_fragment() {
-        assert_eq!(
-            models_url("https://example.com/v1?token=query-secret#client-fragment"),
-            "https://example.com/v1/models?token=query-secret#client-fragment"
-        );
-        assert_eq!(
-            models_url("https://example.com/v1/chat/completions?token=query-secret"),
-            "https://example.com/v1/models?token=query-secret"
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_provider_models_preserves_the_original_request_query() {
-        use std::collections::HashMap;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                let count = stream.read(&mut buffer).await.unwrap();
-                assert!(count > 0, "client closed before sending request headers");
-                request.extend_from_slice(&buffer[..count]);
-            }
-            let request_line = String::from_utf8(request)
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap()
-                .to_string();
-            let body = r#"{"data":[{"id":"model-a"}]}"#;
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            request_line
-        });
-
-        let models = fetch_provider_models(&ProviderConfig {
-            base_url: format!("http://{addr}/v1?token=query-secret#client-fragment"),
-            api_key: String::new(),
-            extra_headers: HashMap::new(),
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(models, vec!["model-a"]);
-        assert_eq!(
-            server.await.unwrap(),
-            "GET /v1/models?token=query-secret HTTP/1.1"
-        );
-    }
+    use crate::coordinator::validate_llm_endpoint;
 
     #[test]
     fn asr_endpoint_rejects_metadata_cgnat_and_non_https_public() {
         // 元数据 / CGNAT / 非 https 外网：拒绝，避免带 API Key 的 ASR 请求被指向高价值目标 / 明文外泄。
-        assert!(validate_http_endpoint("http://169.254.169.254/v1/audio/transcriptions").is_err());
-        assert!(validate_http_endpoint("http://100.64.0.1/v1/audio/transcriptions").is_err());
-        assert!(validate_http_endpoint("http://api.example.com/v1/audio/transcriptions").is_err());
+        assert!(validate_llm_endpoint("http://169.254.169.254/v1/audio/transcriptions").is_err());
+        assert!(validate_llm_endpoint("http://100.64.0.1/v1/audio/transcriptions").is_err());
+        assert!(validate_llm_endpoint("http://api.example.com/v1/audio/transcriptions").is_err());
     }
 
     #[test]
     fn asr_endpoint_accepts_public_https_localhost_and_lan() {
         // 公网 https（如自建 Whisper 网关）放行。
-        validate_http_endpoint("https://api.example.com/v1/audio/transcriptions")
+        validate_llm_endpoint("https://api.example.com/v1/audio/transcriptions")
             .expect("公网 https ASR endpoint 必须通过");
         // 本地 Whisper 服务：localhost / 127.0.0.1 http 放行。
-        validate_http_endpoint("http://localhost:9000/v1").expect("本地 Whisper http 必须通过");
-        validate_http_endpoint("http://127.0.0.1:9000/v1").expect("本地 Whisper http 必须通过");
+        validate_llm_endpoint("http://localhost:9000/v1").expect("本地 Whisper http 必须通过");
+        validate_llm_endpoint("http://127.0.0.1:9000/v1").expect("本地 Whisper http 必须通过");
         // F-01 放宽：局域网（RFC1918）http ASR 网关放行（用户局域网自托管 Whisper）。
-        validate_http_endpoint("http://192.168.1.50:9000/v1/audio/transcriptions")
+        validate_llm_endpoint("http://192.168.1.50:9000/v1/audio/transcriptions")
             .expect("局域网 http ASR endpoint 必须通过");
         // Mimo 官方默认 endpoint（https）放行。
-        validate_http_endpoint(crate::asr::mimo::DEFAULT_ENDPOINT)
+        validate_llm_endpoint(crate::asr::mimo::DEFAULT_ENDPOINT)
             .expect("Mimo 官方默认 endpoint 必须通过");
     }
 }

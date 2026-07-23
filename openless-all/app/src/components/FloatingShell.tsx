@@ -227,7 +227,6 @@ function FloatingShellBody({ os, initialTab, initialSettings }: { os: OS; initia
 
       {/* Main shell — flush with the frosted backplate (no separate float). */}
       <div
-        data-ol-settings-open={settingsOpen ? 'true' : undefined}
         className="ol-app-shell-bg"
         style={{
           flex: 1, minHeight: 0,

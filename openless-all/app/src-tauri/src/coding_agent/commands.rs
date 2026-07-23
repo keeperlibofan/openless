@@ -38,7 +38,9 @@ fn validate_exe(exe: &str) -> Result<(), String> {
         if exe == "claude" {
             return Ok(());
         }
-        return Err(format!("不允许的可执行文件名: {exe}（只接受 'claude' 或已知安装目录下的绝对路径）"));
+        return Err(format!(
+            "不允许的可执行文件名: {exe}（只接受 'claude' 或已知安装目录下的绝对路径）"
+        ));
     }
     // 绝对路径：必须规范化到已知 claude 安装目录之一
     let path = std::path::Path::new(exe);
@@ -46,11 +48,7 @@ fn validate_exe(exe: &str) -> Result<(), String> {
         return Err(format!("不允许的相对路径: {exe}"));
     }
     // 已知 claude 安装目录前缀
-    let known_prefixes: &[&str] = &[
-        "/usr/local/bin/",
-        "/usr/bin/",
-        "/opt/homebrew/bin/",
-    ];
+    let known_prefixes: &[&str] = &["/usr/local/bin/", "/usr/bin/", "/opt/homebrew/bin/"];
     // 也允许 ~/.local/bin/claude（用户目录绝对路径，动态计算）
     let home_prefix = std::env::var("HOME")
         .ok()
@@ -58,11 +56,15 @@ fn validate_exe(exe: &str) -> Result<(), String> {
 
     let exe_norm = exe.replace('\\', "/");
     let allowed = known_prefixes.iter().any(|p| exe_norm.starts_with(p))
-        || home_prefix.as_deref().map_or(false, |p| exe_norm.starts_with(p));
+        || home_prefix
+            .as_deref()
+            .map_or(false, |p| exe_norm.starts_with(p));
     if allowed {
         Ok(())
     } else {
-        Err(format!("不允许的 claude 路径: {exe}（必须位于已知安装目录）"))
+        Err(format!(
+            "不允许的 claude 路径: {exe}（必须位于已知安装目录）"
+        ))
     }
 }
 

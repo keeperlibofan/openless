@@ -55,7 +55,7 @@ export function CodingAgentSection() {
 
   return (
     <Card>
-      <SectionTitle hint={t('settings.codingAgent.desc')}>{t('settings.codingAgent.title')}</SectionTitle>
+      <SectionTitle>{t('settings.codingAgent.title')}</SectionTitle>
       <SectionDesc>{t('settings.codingAgent.desc')}</SectionDesc>
 
       <SettingRow label={t('settings.codingAgent.enable')} desc={t('settings.codingAgent.hotkeyHint')}>

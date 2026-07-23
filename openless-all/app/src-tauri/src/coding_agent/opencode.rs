@@ -28,7 +28,11 @@ use super::{CodingAgentError, CodingAgentPermissionMode};
 
 /// 探测 `opencode` 版本（`None` 表示未安装或无法运行）。复用 claude 的 `x.y.z` 解析。
 pub async fn detect_opencode(exe: &str) -> Option<String> {
-    let out = augmented_command(exe).arg("--version").output().await.ok()?;
+    let out = augmented_command(exe)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -292,7 +296,9 @@ mod tests {
         assert_eq!(args.last().map(|s| s.as_str()), Some("--"));
         // `--` 之前才是各 flag，`--dangerously-skip-permissions` 不在 `--` 之后。
         let dd = args.iter().rposition(|a| a == "--").unwrap();
-        assert!(args[..dd].iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(args[..dd]
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
     }
 
     #[test]
@@ -312,7 +318,10 @@ mod tests {
         req.model = Some("anthropic/claude-sonnet-4".into());
         req.cwd = Some(PathBuf::from("/tmp/work"));
         let args = build_opencode_args(&req);
-        assert_eq!(arg_value(&args, "--model"), Some("anthropic/claude-sonnet-4"));
+        assert_eq!(
+            arg_value(&args, "--model"),
+            Some("anthropic/claude-sonnet-4")
+        );
         assert_eq!(arg_value(&args, "--dir"), Some("/tmp/work"));
     }
 

@@ -159,9 +159,25 @@ pub fn build_guard_settings_json(mode: &str, extra_deny: &[String]) -> serde_jso
 /// [`is_high_risk_command`] 兜底。
 pub fn opencode_bash_deny_prefixes() -> Vec<&'static str> {
     vec![
-        "rm -rf", "rm -fr", "sudo", "git push --force", "git push -f", "git reset --hard",
-        "git clean -fd", "git clean -f -d", "mkfs", "dd", "shutdown", "reboot", "chmod", "chown",
-        "crontab", "osascript", "launchctl", "kextload", "nvram",
+        "rm -rf",
+        "rm -fr",
+        "sudo",
+        "git push --force",
+        "git push -f",
+        "git reset --hard",
+        "git clean -fd",
+        "git clean -f -d",
+        "mkfs",
+        "dd",
+        "shutdown",
+        "reboot",
+        "chmod",
+        "chown",
+        "crontab",
+        "osascript",
+        "launchctl",
+        "kextload",
+        "nvram",
     ]
 }
 
@@ -181,13 +197,19 @@ pub fn build_opencode_guard_config(extra_allow_prefixes: &[String]) -> serde_jso
     // 先放默认：未命中规则一律 allow（轻动作不打断无头执行）。
     bash.insert("*".into(), serde_json::Value::String("allow".into()));
     for prefix in opencode_bash_deny_prefixes() {
-        bash.insert(format!("{prefix} *"), serde_json::Value::String("deny".into()));
+        bash.insert(
+            format!("{prefix} *"),
+            serde_json::Value::String("deny".into()),
+        );
         // 无参形式（如 `reboot`）也要拦：glob `reboot *` 不匹配光秃秃的 `reboot`。
         bash.insert(prefix.to_string(), serde_json::Value::String("deny".into()));
     }
     // 审批放行：把通过的高风险前缀显式 allow，盖掉上面的 deny（后写覆盖）。
     for prefix in extra_allow_prefixes {
-        bash.insert(format!("{prefix} *"), serde_json::Value::String("allow".into()));
+        bash.insert(
+            format!("{prefix} *"),
+            serde_json::Value::String("allow".into()),
+        );
         bash.insert(prefix.clone(), serde_json::Value::String("allow".into()));
     }
 

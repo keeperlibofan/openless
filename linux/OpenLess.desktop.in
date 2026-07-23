@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OpenLess
+Name[zh_CN]=OpenLess 语音输入
+Comment=Local voice input that types where your cursor is
+Comment[zh_CN]=在当前光标位置输入语音转写和润色后的文字
+Exec=@HOME@/.local/bin/openless
+Icon=openless
+Terminal=false
+Categories=Utility;Accessibility;
+StartupWMClass=openless
+StartupNotify=true

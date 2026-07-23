@@ -916,7 +916,10 @@ mod tests {
     fn rate_limited_message_mentions_throttling_not_network() {
         // 文案必须明确指向「限流/请求过多」，不是含糊的「网络失败」。
         let msg = VolcengineASRError::RateLimited(429).to_string();
-        assert!(msg.contains("限流") || msg.contains("请求过多"), "文案: {msg}");
+        assert!(
+            msg.contains("限流") || msg.contains("请求过多"),
+            "文案: {msg}"
+        );
         assert!(!msg.contains("网络"), "限流文案不应误导为网络失败: {msg}");
     }
 

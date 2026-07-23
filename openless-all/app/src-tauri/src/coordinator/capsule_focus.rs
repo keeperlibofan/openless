@@ -395,8 +395,8 @@ pub(super) fn emit_capsule(
     let operating = inner.state.lock().voice_agent;
     // 预备态只对 Recording 有意义：麦克风还没吐第一帧 PCM 时（capsule_warming=true）把
     // warming 打成 true，前端渲染「待命」光效；level_handler 首触发后翻 false → 光条点亮。
-    let warming = matches!(state, CapsuleState::Recording)
-        && inner.capsule_warming.load(Ordering::SeqCst);
+    let warming =
+        matches!(state, CapsuleState::Recording) && inner.capsule_warming.load(Ordering::SeqCst);
     let payload = CapsulePayload {
         state,
         level,

@@ -5,7 +5,7 @@
 <h1 align="center">OpenLess</h1>
 
 <p align="center">
-  <strong>面向 macOS 与 Windows 的开源语音输入工具</strong>
+  <strong>面向 macOS、Windows，以及本 fork Linux/X11 环境的开源语音输入工具</strong>
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://openless.top"><strong>官网</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/appergb/openless/releases/latest"><strong>下载</strong></a>
+  <a href="https://github.com/Open-Less/openless/releases/latest"><strong>官方版本</strong></a>
   &nbsp;·&nbsp;
   <a href="README.md">English</a>
   &nbsp;/&nbsp;
@@ -24,9 +24,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/appergb/openless/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/appergb/openless?style=flat-square&color=2c5282" /></a>
-  <a href="https://github.com/appergb/openless/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/appergb/openless?style=flat-square&color=2f855a" /></a>
-  <a href="https://github.com/appergb/openless/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/appergb/openless?style=flat-square&color=805ad5" /></a>
+  <a href="https://github.com/Open-Less/openless/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Open-Less/openless?style=flat-square&color=2c5282" /></a>
+  <a href="https://github.com/Open-Less/openless/blob/beta/LICENSE"><img alt="License" src="https://img.shields.io/github/license/Open-Less/openless?style=flat-square&color=2f855a" /></a>
+  <a href="https://github.com/keeperlibofan/openless"><img alt="个人 fork" src="https://img.shields.io/badge/fork-keeperlibofan%2Fopenless-805ad5?style=flat-square&logo=github" /></a>
   <a href="https://discord.gg/vTZHTFGFm"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
 </p>
 
@@ -42,6 +42,14 @@
 </p>
 
 <br/>
+
+> [!IMPORTANT]
+> 这是基于 MIT 许可证官方项目
+> [Open-Less/openless](https://github.com/Open-Less/openless) 的个人 fork。
+> `codex/linux-continuous-dictation` 分支保存了 `keeperlibofan` 当前实际使用的
+> Linux/X11 版本，包括 Fcitx 4/搜狗兼容、连续录音有序后台处理、光标插入、历史自动刷新、
+> 麦克风音量浮窗和可拖动定位。重装与灾难恢复方法见
+> [linux/README.md](linux/README.md)。
 
 <h2 align="center">赞助商</h2>
 

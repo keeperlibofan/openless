@@ -92,14 +92,6 @@ pub enum LLMError {
     CodexAuth(String),
 }
 
-pub(crate) fn llm_error_from_reqwest(error: reqwest::Error) -> LLMError {
-    if error.is_timeout() {
-        LLMError::Timeout
-    } else {
-        LLMError::Network(crate::net::request_error_kind(&error).to_string())
-    }
-}
-
 pub enum ActiveLLMProvider {
     OpenAI(OpenAICompatibleLLMProvider),
     Codex(CodexOAuthLLMProvider),
@@ -470,7 +462,7 @@ impl OpenAICompatibleLLMProvider {
 
         log::info!(
             "[llm] POST {} provider={} model={} prior_turns={}",
-            crate::net::sanitized_url_for_logs(&url),
+            url,
             self.config.provider_id,
             self.config.model,
             prior_turns.len()
@@ -496,7 +488,7 @@ impl OpenAICompatibleLLMProvider {
 
         log::info!(
             "[llm] POST {} provider={} model={}",
-            crate::net::sanitized_url_for_logs(&url),
+            url,
             self.config.provider_id,
             self.config.model
         );
@@ -537,7 +529,10 @@ impl OpenAICompatibleLLMProvider {
         let response = send_with_transient_retry(request).await?;
 
         let status = response.status();
-        let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
+        let body_text = response
+            .text()
+            .await
+            .map_err(|e| LLMError::Network(e.to_string()))?;
 
         let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
         let preview = safe_str_slice(&body_text, preview_end);
@@ -578,7 +573,7 @@ impl OpenAICompatibleLLMProvider {
 
         log::info!(
             "[llm] POST {} provider={} model={} chat_turns={} stream=true",
-            crate::net::sanitized_url_for_logs(&url),
+            url,
             self.config.provider_id,
             self.config.model,
             history.len()
@@ -602,7 +597,10 @@ impl OpenAICompatibleLLMProvider {
         let status = response.status();
         if !status.is_success() {
             // 失败时仍把 body 读一遍方便诊断
-            let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
+            let body_text = response
+                .text()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
             let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
             let preview = safe_str_slice(&body_text, preview_end);
             log::error!("[llm] HTTP {} body={}", status.as_u16(), preview);
@@ -627,7 +625,10 @@ impl OpenAICompatibleLLMProvider {
                 cancelled = true;
                 break;
             }
-            let chunk_opt = response.chunk().await.map_err(llm_error_from_reqwest)?;
+            let chunk_opt = response
+                .chunk()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
             let Some(chunk) = chunk_opt else { break };
             append_utf8_sse_chunk(&mut buffer, &mut utf8_pending, &chunk)?;
 
@@ -716,7 +717,10 @@ impl OpenAICompatibleLLMProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
+            let body_text = response
+                .text()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
             let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
             let preview = safe_str_slice(&body_text, preview_end);
             log::error!("[llm] streaming HTTP {} body={}", status.as_u16(), preview);
@@ -742,7 +746,10 @@ impl OpenAICompatibleLLMProvider {
                 cancelled = true;
                 break;
             }
-            let chunk_opt = response.chunk().await.map_err(llm_error_from_reqwest)?;
+            let chunk_opt = response
+                .chunk()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
             let Some(chunk) = chunk_opt else { break };
             append_utf8_sse_chunk(&mut buffer, &mut utf8_pending, &chunk)?;
 
@@ -1051,7 +1058,7 @@ impl CodexOAuthLLMProvider {
 
         log::info!(
             "[llm] POST {} provider={} model={} stream=true",
-            crate::net::sanitized_url_for_logs(&url),
+            url,
             CODEX_OAUTH_PROVIDER_ID,
             self.config.model
         );
@@ -1072,13 +1079,16 @@ impl CodexOAuthLLMProvider {
                 if e.is_timeout() {
                     return Err(LLMError::Timeout);
                 }
-                return Err(llm_error_from_reqwest(e));
+                return Err(LLMError::Network(e.to_string()));
             }
         };
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
+            let body_text = response
+                .text()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
             let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
             let preview = safe_str_slice(&body_text, preview_end);
             log::error!("[llm] codex HTTP {} body={}", status.as_u16(), preview);
@@ -1100,7 +1110,10 @@ impl CodexOAuthLLMProvider {
                 cancelled = true;
                 break;
             }
-            let chunk_opt = response.chunk().await.map_err(llm_error_from_reqwest)?;
+            let chunk_opt = response
+                .chunk()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
             let Some(chunk) = chunk_opt else { break };
             append_utf8_sse_chunk(&mut buffer, &mut utf8_pending, &chunk)?;
 
@@ -1222,15 +1235,11 @@ fn build_polish_history_messages(
 
 fn chat_completions_url(base_url: &str) -> String {
     let trimmed = base_url.trim();
-    let Ok(mut url) = reqwest::Url::parse(trimmed) else {
-        let fallback = trimmed.trim_end_matches('/');
-        return format!("{fallback}/chat/completions");
-    };
-    let path = url.path().trim_end_matches('/');
-    if !path.ends_with("/chat/completions") {
-        url.set_path(&format!("{path}/chat/completions"));
+    if trimmed.ends_with("/chat/completions") {
+        return trimmed.to_string();
     }
-    url.to_string()
+    let without_trailing = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    format!("{}/chat/completions", without_trailing)
 }
 
 pub(crate) fn http_client_builder(base_url: &str, timeout_secs: u64) -> reqwest::ClientBuilder {
@@ -1274,21 +1283,37 @@ async fn send_with_transient_retry(
         log::warn!("[llm] request body not clonable, skipping retry");
         return match request.send().await {
             Ok(r) => Ok(r),
-            Err(e) => Err(llm_error_from_reqwest(e)),
+            Err(e) if e.is_timeout() => Err(LLMError::Timeout),
+            Err(e) => Err(LLMError::Network(e.to_string())),
         };
     };
     match initial.send().await {
         Ok(r) => Ok(r),
         Err(e) if should_retry_transient(e.is_connect(), e.is_request(), e.is_timeout()) => {
-            let failure = crate::net::request_error_kind(&e);
-            log::warn!("[llm] send transient {failure} failure, retry in {RETRY_DELAY_MS}ms");
+            log::warn!(
+                "[llm] send transient failure, retry in {}ms: {}",
+                RETRY_DELAY_MS,
+                e
+            );
             tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
             match request.send().await {
                 Ok(r) => Ok(r),
-                Err(e2) => Err(llm_error_from_reqwest(e2)),
+                Err(e2) => {
+                    if e2.is_timeout() {
+                        Err(LLMError::Timeout)
+                    } else {
+                        Err(LLMError::Network(e2.to_string()))
+                    }
+                }
             }
         }
-        Err(e) => Err(llm_error_from_reqwest(e)),
+        Err(e) => {
+            if e.is_timeout() {
+                Err(LLMError::Timeout)
+            } else {
+                Err(LLMError::Network(e.to_string()))
+            }
+        }
     }
 }
 
@@ -1971,16 +1996,6 @@ mod tests {
     use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-
-    #[test]
-    fn chat_completions_url_preserves_query_and_fragment() {
-        assert_eq!(
-            chat_completions_url(
-                "https://user:pass@example.com/v1?token=query-secret#client-fragment"
-            ),
-            "https://user:pass@example.com/v1/chat/completions?token=query-secret#client-fragment"
-        );
-    }
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::thread;

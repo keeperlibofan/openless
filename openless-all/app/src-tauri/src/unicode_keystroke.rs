@@ -635,7 +635,10 @@ mod tests {
                 classify_sendinput_char('\n'),
                 SendInputCharKind::Newline
             ));
-            assert!(matches!(classify_sendinput_char('\t'), SendInputCharKind::Tab));
+            assert!(matches!(
+                classify_sendinput_char('\t'),
+                SendInputCharKind::Tab
+            ));
         }
 
         #[test]

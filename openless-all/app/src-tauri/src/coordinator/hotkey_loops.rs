@@ -345,19 +345,22 @@ pub(super) fn less_computer_modifier_binding(
     })
 }
 
-pub(super) fn less_computer_modifier_bridge_loop(inner: Arc<Inner>, rx: mpsc::Receiver<HotkeyEvent>) {
+pub(super) fn less_computer_modifier_bridge_loop(
+    inner: Arc<Inner>,
+    rx: mpsc::Receiver<HotkeyEvent>,
+) {
     while let Ok(evt) = rx.recv() {
         if inner.shortcut_recording_active.load(Ordering::SeqCst) {
             continue;
         }
         let inner_cloned = Arc::clone(&inner);
         match evt {
-            HotkeyEvent::Pressed { .. } => {
+            HotkeyEvent::Pressed => {
                 async_runtime::block_on(async {
                     handle_less_computer_pressed(&inner_cloned).await
                 });
             }
-            HotkeyEvent::Released { .. } => {
+            HotkeyEvent::Released => {
                 async_runtime::block_on(async {
                     handle_less_computer_released(&inner_cloned).await
                 });
@@ -368,19 +371,22 @@ pub(super) fn less_computer_modifier_bridge_loop(inner: Arc<Inner>, rx: mpsc::Re
     }
 }
 
-pub(super) fn less_computer_combo_bridge_loop(inner: Arc<Inner>, rx: mpsc::Receiver<ComboHotkeyEvent>) {
+pub(super) fn less_computer_combo_bridge_loop(
+    inner: Arc<Inner>,
+    rx: mpsc::Receiver<ComboHotkeyEvent>,
+) {
     while let Ok(evt) = rx.recv() {
         if inner.shortcut_recording_active.load(Ordering::SeqCst) {
             continue;
         }
         let inner_cloned = Arc::clone(&inner);
         match evt {
-            ComboHotkeyEvent::Pressed { .. } => {
+            ComboHotkeyEvent::Pressed => {
                 async_runtime::block_on(async {
                     handle_less_computer_pressed(&inner_cloned).await
                 });
             }
-            ComboHotkeyEvent::Released { .. } => {
+            ComboHotkeyEvent::Released => {
                 async_runtime::block_on(async {
                     handle_less_computer_released(&inner_cloned).await
                 });
@@ -519,7 +525,9 @@ pub(super) fn combo_hotkey_supervisor_loop(inner: Arc<Inner>) {
                 Err(e) => {
                     attempts += 1;
                     if attempts <= 3 || attempts % 10 == 0 {
-                        log::warn!("[coord] side-aware combo 第 {attempts} 次注册失败: {e}; 3s 后重试");
+                        log::warn!(
+                            "[coord] side-aware combo 第 {attempts} 次注册失败: {e}; 3s 后重试"
+                        );
                     }
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     continue;
@@ -601,14 +609,14 @@ pub(super) fn combo_hotkey_bridge_loop(inner: Arc<Inner>, rx: mpsc::Receiver<Com
         match evt {
             // P0 #468/#475: 同 hotkey_bridge_loop —— Pressed/Released 必须串行 await，
             // 否则 latch 竞态导致 combo 快捷键二次按键失效。
-            ComboHotkeyEvent::Pressed { at } => {
+            ComboHotkeyEvent::Pressed => {
                 async_runtime::block_on(async {
-                    handle_pressed_edge(&inner_cloned, at).await;
+                    handle_pressed_edge(&inner_cloned).await;
                 });
             }
-            ComboHotkeyEvent::Released { at } => {
+            ComboHotkeyEvent::Released => {
                 async_runtime::block_on(async {
-                    handle_released_edge(&inner_cloned, at).await;
+                    handle_released_edge(&inner_cloned).await;
                 });
             }
         }
@@ -706,12 +714,15 @@ pub(super) fn update_translation_hotkey_on_main_thread(
     Ok(())
 }
 
-pub(super) fn translation_hotkey_bridge_loop(inner: Arc<Inner>, rx: mpsc::Receiver<ComboHotkeyEvent>) {
+pub(super) fn translation_hotkey_bridge_loop(
+    inner: Arc<Inner>,
+    rx: mpsc::Receiver<ComboHotkeyEvent>,
+) {
     while let Ok(evt) = rx.recv() {
         if inner.shortcut_recording_active.load(Ordering::SeqCst) {
             continue;
         }
-        if matches!(evt, ComboHotkeyEvent::Pressed { .. }) {
+        if matches!(evt, ComboHotkeyEvent::Pressed) {
             mark_translation_modifier_seen(&inner);
         }
     }
@@ -807,7 +818,7 @@ pub(super) fn action_hotkey_bridge_loop(
         if inner.shortcut_recording_active.load(Ordering::SeqCst) {
             continue;
         }
-        if matches!(evt, ComboHotkeyEvent::Pressed { .. }) {
+        if matches!(evt, ComboHotkeyEvent::Pressed) {
             handle_action_hotkey_pressed(&inner, kind);
         }
     }
@@ -1026,14 +1037,14 @@ pub(super) fn hotkey_bridge_loop(inner: Arc<Inner>, rx: mpsc::Receiver<HotkeyEve
             // 里直到 begin_session 完成，但 SessionPhase::Starting 已经有
             // request_stop_during_starting 兜底，begin_session 完成进 Listening 后
             // bridge 立刻 recv Released → end_session，行为正确，仅有短暂 stop 延迟。
-            HotkeyEvent::Pressed { at } => {
+            HotkeyEvent::Pressed => {
                 async_runtime::block_on(async {
-                    handle_pressed_edge(&inner_cloned, at).await;
+                    handle_pressed_edge(&inner_cloned).await;
                 });
             }
-            HotkeyEvent::Released { at } => {
+            HotkeyEvent::Released => {
                 async_runtime::block_on(async {
-                    handle_released_edge(&inner_cloned, at).await;
+                    handle_released_edge(&inner_cloned).await;
                 });
             }
             HotkeyEvent::Cancelled => {
@@ -1161,11 +1172,11 @@ pub(super) async fn handle_window_hotkey_event(
                 log::info!(
                     "[window-hotkey] pressed trigger={trigger:?} code={code} repeat={repeat}"
                 );
-                handle_pressed_edge(inner, std::time::Instant::now()).await;
+                handle_pressed_edge(inner).await;
             }
             "keyup" => {
                 log::info!("[window-hotkey] released trigger={trigger:?} code={code}");
-                handle_released_edge(inner, std::time::Instant::now()).await;
+                handle_released_edge(inner).await;
             }
             _ => {}
         }
@@ -1178,7 +1189,11 @@ pub(super) fn window_hotkey_fallback_enabled() -> bool {
 }
 
 #[cfg(any(target_os = "windows", test))]
-pub(super) fn window_key_matches_trigger(trigger: crate::types::HotkeyTrigger, key: &str, code: &str) -> bool {
+pub(super) fn window_key_matches_trigger(
+    trigger: crate::types::HotkeyTrigger,
+    key: &str,
+    code: &str,
+) -> bool {
     use crate::types::HotkeyTrigger;
 
     match trigger {

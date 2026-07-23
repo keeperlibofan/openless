@@ -1,7 +1,6 @@
 //! Mobile stub — global hotkeys are unavailable on Android/iOS.
 
 use std::sync::mpsc::Sender;
-use std::time::Instant;
 
 use crate::types::{
     HotkeyAdapterKind, HotkeyBinding, HotkeyCapability, HotkeyInstallError, HotkeyTrigger,
@@ -9,8 +8,8 @@ use crate::types::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyEvent {
-    Pressed { at: Instant },
-    Released { at: Instant },
+    Pressed,
+    Released,
     Cancelled,
     TranslationModifierPressed,
     QaShortcutPressed,

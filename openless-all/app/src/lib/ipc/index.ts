@@ -188,21 +188,8 @@ export {
 } from "./marketplace"
 
 // github-oauth
-export type {
-    GithubDeviceStartResponse,
-    GithubDevicePollResult,
-    MarketplaceAuthStatus,
-} from "./github-oauth"
-export {
-    githubDeviceFlowStart,
-    githubDeviceFlowPoll,
-    githubDeviceFlowCancel,
-    githubPollIntervalMs,
-    githubSlowDownIntervalMs,
-    githubFlowExpiresAt,
-    marketplaceAuthStatus,
-    marketplaceLogout,
-} from "./github-oauth"
+export type { GithubDeviceStartResponse, GithubDevicePollResult } from "./github-oauth"
+export { githubDeviceFlowStart, githubDeviceFlowPoll } from "./github-oauth"
 
 // marketplace-cache
 export {

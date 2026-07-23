@@ -95,7 +95,7 @@ export type HotkeyTrigger =
   | 'mediaPlayPause'
   | 'custom';
 
-export type HotkeyMode = 'toggle' | 'hold' | 'doubleClick' | 'auto';
+export type HotkeyMode = 'toggle' | 'hold' | 'doubleClick';
 
 export interface HotkeyKey {
   code: string;
@@ -389,7 +389,7 @@ export interface UserPreferences {
   audioRecordingMaxEntries: number | null;
   /** Marketplace HTTP 基地址。空 = 本地开发默认 http://127.0.0.1:8090；生产填 https://api.<domain>。 */
   marketplaceBaseUrl: string;
-  /** GitHub login 展示缓存。不用于认证；OAuth token 只存在 Rust CredentialsVault。 */
+  /** Marketplace dev-mode 模拟登录用户名（GitHub login 风格）。生产换 OAuth token 后此字段废弃。 */
   marketplaceDevLogin: string;
   /** 是否启用远程输入（局域网手机录音）HTTPS+WS 服务。默认 false。 */
   remoteInputEnabled: boolean;

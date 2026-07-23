@@ -2,44 +2,27 @@
 // AsrPresetId 也放在这里，让 settings/ 下各 section 都从同一处来源拿。
 
 import type { CSSProperties, ReactNode } from "react"
-import { Tooltip } from "../../components/Tooltip"
 import { useMobileLayout } from "../../lib/useMobileLayout"
-
-// 带说明的文字统一加虚线下划线 + help 光标，暗示「悬停可看解释」。
-const hintableTextStyle: CSSProperties = {
-    cursor: "help",
-    textDecoration: "underline dotted",
-    textDecorationColor: "var(--ol-ink-4)",
-    textUnderlineOffset: 3,
-}
 
 export function SectionTitle({
     children,
-    hint,
     style,
 }: {
     children: ReactNode
-    /** 悬停在标题文字上时的功能说明，给 Less Computer 这类光看名字猜不出用途的板块。 */
-    hint?: string
     style?: CSSProperties
 }) {
-    const titleStyle: CSSProperties = {
-        fontSize: 14,
-        fontWeight: 600,
-        color: "var(--ol-ink)",
-        marginBottom: 6,
-        letterSpacing: "-0.01em",
-        ...style,
-    }
-    if (!hint) {
-        return <div style={titleStyle}>{children}</div>
-    }
     return (
-        // display:flex 让 Tooltip 的锚点收缩到标题文字本身，提示贴着文字弹出。
-        <div style={{ ...titleStyle, display: "flex" }}>
-            <Tooltip content={hint} wrap placement="bottom" focusable>
-                <span style={hintableTextStyle}>{children}</span>
-            </Tooltip>
+        <div
+            style={{
+                fontSize: 14,
+                fontWeight: 600,
+                color: "var(--ol-ink)",
+                marginBottom: 6,
+                letterSpacing: "-0.01em",
+                ...style,
+            }}
+        >
+            {children}
         </div>
     )
 }
@@ -59,21 +42,13 @@ interface SettingRowProps {
     controlWidth?: number | string
 }
 
-// 页面瘦身后描述小字不再常驻展示；desc 改为悬停在标签文字上时以 Tooltip 弹出，
-// 布局保持紧凑的同时不牺牲可理解性。
+// 页面瘦身：不再渲染每行的描述小字（desc 仍保留在 props 里，调用点无需改、便于恢复）。
 export function SettingRow({
     label,
-    desc,
     children,
     controlWidth,
 }: SettingRowProps) {
     const mobile = useMobileLayout()
-    const labelStyle: CSSProperties = {
-        fontSize: 13,
-        fontWeight: 500,
-        color: "var(--ol-ink)",
-        minWidth: 0,
-    }
     return (
         <div
             style={{
@@ -85,15 +60,16 @@ export function SettingRow({
                 alignItems: "center",
             }}
         >
-            {/* display:flex 让 Tooltip 锚点收缩到文字宽度，提示贴着文字弹出。 */}
-            <div style={{ minWidth: 0, alignSelf: "center", display: "flex" }}>
-                {desc ? (
-                    <Tooltip content={desc} wrap placement="bottom" focusable>
-                        <span style={{ ...labelStyle, ...hintableTextStyle }}>{label}</span>
-                    </Tooltip>
-                ) : (
-                    <div style={labelStyle}>{label}</div>
-                )}
+            <div style={{ minWidth: 0, alignSelf: "center" }}>
+                <div
+                    style={{
+                        fontSize: 13,
+                        fontWeight: 500,
+                        color: "var(--ol-ink)",
+                    }}
+                >
+                    {label}
+                </div>
             </div>
             <div
                 style={{
@@ -199,46 +175,18 @@ export const inputStyle: CSSProperties = {
         "background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick)",
 }
 
-// ASR provider preset 清单 —— 单一来源，放这里让 ProvidersSection /
-// LocalModelSection / Overview 都从同一处取，不再各维护一份 id 列表导致漂移。
-// `AsrPresetId` 由此派生（与 ProvidersSection 的 LLM_PRESETS→LlmPresetId 同构）。
-//
-// 新增兼容厂商：
-//   1. 这里加一项 `{ id, nameKey, baseUrl, model }`；
-//   2. 后端 `coordinator.rs::active_asr_provider_kind` 加 id→kind 映射 —— 之后
-//      `preflight_credential` / `configured_fields` 等穷尽 match 会被编译器逐个
-//      报错逼你补齐；走 Whisper 协议再加进 `is_whisper_compatible_provider`，
-//      专有协议另配独立 ASR client 与 provider kind；
-//   3. i18n 的 `settings.providers.presets.<nameKey>` 补各语言文案。
-export const ASR_PRESETS = [
-  { id: 'volcengine',   nameKey: 'asrVolcengine',   baseUrl: '',                                              model: ''                              },
-  { id: 'elevenlabs',   nameKey: 'asrElevenLabs',   baseUrl: 'https://api.elevenlabs.io/v1',                  model: 'scribe_v2'                     },
-  { id: 'bailian',      nameKey: 'asrBailian',     baseUrl: 'wss://dashscope.aliyuncs.com/api-ws/v1/inference/', model: 'fun-asr-realtime'             },
-  // Qwen3-ASR-Flash 实时：OpenAI Realtime 风格 WS（/api-ws/v1/realtime），
-  // 与上面经典 inference 协议不同，由 asr/qwen_realtime.rs 专用 client 处理。
-  // 业务空间专属域名（wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime）同样可用。
-  { id: 'bailian-qwen3-realtime', nameKey: 'asrBailianQwen3', baseUrl: 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime', model: 'qwen3-asr-flash-realtime' },
-  // Fun-ASR-Flash 录音文件识别：非实时，走 DashScope 私有的
-  // multimodal-generation HTTP 接口（既非实时 WS，也非 OpenAI /audio/transcriptions），
-  // 由 asr/dashscope_multimodal.rs 专用批量 client 处理。API key 与百炼同一把。
-  { id: 'bailian-fun-asr-flash', nameKey: 'asrBailianFunAsrFlash', baseUrl: 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation', model: 'fun-asr-flash-2026-06-15' },
-  { id: 'siliconflow',  nameKey: 'asrSiliconflow',  baseUrl: 'https://api.siliconflow.cn/v1',                  model: 'FunAudioLLM/SenseVoiceSmall' },
-  { id: 'zhipu',        nameKey: 'asrZhipu',        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',           model: 'glm-asr-2512'                },
-  { id: 'groq',         nameKey: 'asrGroq',         baseUrl: 'https://api.groq.com/openai/v1',                 model: 'whisper-large-v3-turbo'      },
-  { id: 'whisper',      nameKey: 'asrWhisper',      baseUrl: 'https://api.openai.com/v1',                      model: 'whisper-1'                   },
-  // OpenRouter 的 /audio/transcriptions 走 application/json + base64（issue #582），
-  // 后端 coordinator.rs::whisper_request_format 对该 id 切换到 OpenRouterJson 编码。
-  { id: 'openrouter',   nameKey: 'asrOpenrouter',   baseUrl: 'https://openrouter.ai/api/v1',                   model: 'openai/whisper-large-v3-turbo' },
-  // 小米 MiMo ASR 按官方文档走 /chat/completions + input_audio，不是
-  // Whisper /audio/transcriptions；后端由 asr/mimo.rs 专用 client 处理。
-  { id: 'xiaomi-mimo-asr', nameKey: 'asrXiaomiMimo', baseUrl: 'https://api.xiaomimimo.com/v1',                  model: 'mimo-v2.5-asr'               },
-  { id: 'foundry-local-whisper', nameKey: 'asrFoundryLocalWhisper', baseUrl: '',                              model: ''                              },
-  // 本地引擎（Foundry / sherpa-onnx / Qwen3）：无 baseUrl/model 配置，
-  // 模型在「高级 → 本地模型」里下载与切换。
-  { id: 'sherpa-onnx-local',     nameKey: 'asrSherpaOnnxLocal',     baseUrl: '',                              model: ''                              },
-  { id: 'local-qwen3',  nameKey: 'asrLocalQwen3',   baseUrl: '',                                              model: ''                              },
-  // Apple 系统语音识别（macOS）：无 baseUrl/model、无下载、无凭据。
-  { id: 'apple-speech', nameKey: 'asrAppleSpeech',  baseUrl: '',                                              model: ''                              },
-] as const;
-
-export type AsrPresetId = typeof ASR_PRESETS[number]['id'];
+// ASR provider id 集合，跟 ProvidersSection.tsx::ASR_PRESETS 一一对应。
+// 拆成独立类型让 LocalModelSection / ProvidersSection 都能用同一份不互相依赖。
+export type AsrPresetId =
+    | "volcengine"
+    | "bailian"
+    | "siliconflow"
+    | "zhipu"
+    | "groq"
+    | "whisper"
+    | "openrouter"
+    | "xiaomi-mimo-asr"
+    | "foundry-local-whisper"
+    | "sherpa-onnx-local"
+    | "local-qwen3"
+    | "apple-speech"

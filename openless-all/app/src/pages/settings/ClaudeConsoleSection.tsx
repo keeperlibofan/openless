@@ -14,7 +14,6 @@ import {
   type CodingAgentEvent,
   type CodingAgentPermissionMode,
 } from '../../lib/ipc'
-import { Tooltip } from '../../components/Tooltip'
 import { Btn, Card } from '../_atoms'
 import { SectionDesc, SectionTitle, SettingRow, inputStyle } from './shared'
 
@@ -151,8 +150,7 @@ export function ClaudeConsoleSection() {
 
   return (
     <Card>
-      <Tooltip content={t('settings.codingConsole.desc')} wrap placement="bottom">
-        <button
+      <button
         onClick={() => setExpanded(v => !v)}
         style={{ all: 'unset', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, width: '100%' }}
       >
@@ -160,8 +158,7 @@ export function ClaudeConsoleSection() {
         <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--ol-ink-4)' }}>
           {expanded ? `${t('common.hide')} ▴` : `${t('common.show')} ▾`}
         </span>
-        </button>
-      </Tooltip>
+      </button>
       <SectionDesc>{t('settings.codingConsole.desc')}</SectionDesc>
 
       {expanded && (

@@ -1,0 +1,23 @@
+{
+  "description": "Non-secret reference only; configure credentials through the OpenLess UI.",
+  "hotkey": {
+    "trigger": "rightOption",
+    "mode": "hold",
+    "keys": null
+  },
+  "dictationHotkey": {
+    "primary": "RightOption",
+    "modifiers": []
+  },
+  "defaultMode": "structured",
+  "activeStylePackId": "builtin.structured",
+  "activeAsrProvider": "bailian",
+  "asrModel": "fun-asr-realtime",
+  "activeLlmProvider": "deepseek",
+  "llmModel": "deepseek-v4-flash",
+  "outputLanguagePreference": "auto",
+  "streamingInsert": true,
+  "showCapsule": true,
+  "restoreClipboardAfterPaste": true,
+  "pasteShortcut": "ctrlV"
+}

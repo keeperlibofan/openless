@@ -3,12 +3,12 @@
 pub mod accessibility;
 #[cfg(target_os = "android")]
 pub mod insert;
-pub mod updater_logic;
-#[cfg(target_os = "android")]
-pub mod updater;
 pub mod jni;
 pub mod native_bridge;
 pub mod overlay;
+#[cfg(target_os = "android")]
+pub mod updater;
+pub mod updater_logic;
 pub use crate::types::android_types as types;
 
 pub use accessibility::{

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PREFIX="@PREFIX@"
+
+systemctl --user start openless-fcitx4-bridge.service
+
+if [[ -d "$PREFIX/lib" ]]; then
+  export LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+exec "$PREFIX/bin/openless" "$@"

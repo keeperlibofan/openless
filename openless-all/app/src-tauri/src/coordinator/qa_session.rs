@@ -60,7 +60,10 @@ pub(super) async fn finalize_dictation_as_qa_question(inner: &Arc<Inner>) -> Res
     answer_qa_question_text(inner, raw.text.trim().to_string(), raw.duration_ms).await
 }
 
-pub(super) async fn submit_qa_text_question(inner: &Arc<Inner>, text: String) -> Result<(), String> {
+pub(super) async fn submit_qa_text_question(
+    inner: &Arc<Inner>,
+    text: String,
+) -> Result<(), String> {
     let question = text.trim().to_string();
     if question.is_empty() {
         return Ok(());
@@ -136,24 +139,12 @@ pub(super) async fn take_current_dictation_transcript_for_qa(
     };
 
     let mut raw = match transcribe_overlay_dictation_asr(inner, current_session_id, asr).await {
-        OverlayDictationTranscribeOutcome::Done(Ok(raw)) => raw,
-        OverlayDictationTranscribeOutcome::Done(Err(error)) => {
+        Ok(raw) => raw,
+        Err(error) => {
             restore_prepared_windows_ime_session(inner, current_session_id);
             set_phase_idle_if_session_matches(inner, current_session_id);
             finish_qa_with_error(inner, format!("识别失败: {error}"));
             return Err(error);
-        }
-        OverlayDictationTranscribeOutcome::Cancelled => {
-            restore_prepared_windows_ime_session(inner, current_session_id);
-            {
-                let mut state = inner.state.lock();
-                if state.session_id == current_session_id {
-                    state.phase = SessionPhase::Idle;
-                    state.focus_target = None;
-                }
-            }
-            finish_qa_idle_silently(inner);
-            return Ok(None);
         }
     };
 
@@ -217,18 +208,13 @@ pub(super) async fn wait_for_dictation_listening(inner: &Arc<Inner>) -> Result<(
     }
 }
 
-pub(super) enum OverlayDictationTranscribeOutcome {
-    Done(Result<RawTranscript, String>),
-    Cancelled,
-}
-
 pub(super) async fn transcribe_overlay_dictation_asr(
     _inner: &Arc<Inner>,
     _current_session_id: SessionId,
     asr: ActiveAsr,
-) -> OverlayDictationTranscribeOutcome {
+) -> Result<RawTranscript, String> {
     let uses_global_timeout = asr_transcribe_uses_global_timeout(&asr);
-    let result = match asr {
+    match asr {
         ActiveAsr::Volcengine(asr) => {
             debug_assert!(uses_global_timeout);
             if let Err(error) = asr.send_last_frame().await {
@@ -259,21 +245,6 @@ pub(super) async fn transcribe_overlay_dictation_asr(
                 }
             }
         }
-        ActiveAsr::Qwen3Realtime(asr) => {
-            debug_assert!(uses_global_timeout);
-            if let Err(error) = asr.send_last_frame().await {
-                log::error!("[coord] overlay QA: Qwen3 realtime send last frame failed: {error}");
-            }
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-            match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
-                Ok(Ok(raw)) => Ok(raw),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(_) => {
-                    asr.cancel();
-                    Err("qwen3 realtime global timeout".to_string())
-                }
-            }
-        }
         ActiveAsr::Whisper(whisper) => {
             debug_assert!(uses_global_timeout);
             let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
@@ -292,38 +263,13 @@ pub(super) async fn transcribe_overlay_dictation_asr(
                 Err(_) => Err("mimo global timeout".to_string()),
             }
         }
-        ActiveAsr::DashScopeMultimodal(asr) => {
-            debug_assert!(uses_global_timeout);
-            let audio_secs = asr.buffer_duration_ms() as f64 / 1000.0;
-            let timeout_duration = whisper_transcribe_timeout(audio_secs);
-            match tokio::time::timeout(timeout_duration, asr.transcribe()).await {
-                Ok(Ok(raw)) => Ok(raw),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(_) => Err("dashscope multimodal global timeout".to_string()),
-            }
-        }
-        ActiveAsr::ElevenLabs(asr) => {
-            debug_assert!(uses_global_timeout);
-            let audio_secs = asr.buffer_duration_ms() as f64 / 1000.0;
-            let timeout_duration = crate::asr::elevenlabs::transcribe_timeout(audio_secs);
-            tokio::select! {
-                result = tokio::time::timeout(timeout_duration, asr.transcribe()) => match result {
-                    Ok(Ok(raw)) => Ok(raw),
-                    Ok(Err(error)) => Err(error.to_string()),
-                    Err(_) => Err("elevenlabs dynamic timeout".to_string()),
-                },
-                _ = wait_for_overlay_dictation_cancel(_inner, _current_session_id) => {
-                    asr.cancel();
-                    return OverlayDictationTranscribeOutcome::Cancelled;
-                }
-            }
-        }
         #[cfg(target_os = "windows")]
         ActiveAsr::FoundryLocalWhisper(local) => {
             debug_assert!(!uses_global_timeout);
-            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-            let timeout_duration = windows_local_asr_transcribe_timeout(audio_secs);
-            match local.transcribe(timeout_duration).await {
+            match local
+                .transcribe(foundry_audio_transcribe_timeout_duration())
+                .await
+            {
                 Ok(raw) => {
                     schedule_foundry_local_asr_release(
                         _inner,
@@ -343,9 +289,10 @@ pub(super) async fn transcribe_overlay_dictation_asr(
         #[cfg(target_os = "windows")]
         ActiveAsr::SherpaOnnxLocal(local) => {
             debug_assert!(!uses_global_timeout);
-            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-            let timeout_duration = windows_local_asr_transcribe_timeout(audio_secs);
-            match local.transcribe(timeout_duration).await {
+            match local
+                .transcribe(sherpa_audio_transcribe_timeout_duration())
+                .await
+            {
                 Ok(raw) => {
                     schedule_sherpa_onnx_release(
                         _inner,
@@ -390,8 +337,7 @@ pub(super) async fn transcribe_overlay_dictation_asr(
                 Err(_) => Err("apple speech transcribe timeout".to_string()),
             }
         }
-    };
-    OverlayDictationTranscribeOutcome::Done(result)
+    }
 }
 
 pub(super) async fn answer_qa_question_text(
@@ -840,30 +786,6 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                 }
             }
         }
-        ActiveAsr::Qwen3Realtime(asr) => {
-            debug_assert!(uses_global_timeout);
-            if let Err(e) = asr.send_last_frame().await {
-                log::error!("[coord] QA: Qwen3 realtime send last frame failed: {e}");
-            }
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-            match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    log::error!("[coord] QA: Qwen3 realtime await final failed: {e}");
-                    finish_qa_with_error(inner, format!("识别失败: {e}"));
-                    return Err(e.to_string());
-                }
-                Err(_) => {
-                    log::error!(
-                        "[coord] QA: Qwen3 realtime 全局超时 {} 秒",
-                        COORDINATOR_GLOBAL_TIMEOUT_SECS
-                    );
-                    asr.cancel();
-                    finish_qa_with_error(inner, "识别超时".to_string());
-                    return Err("qwen3 realtime global timeout".to_string());
-                }
-            }
-        }
         ActiveAsr::Whisper(w) => {
             debug_assert!(uses_global_timeout);
             let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
@@ -904,63 +826,13 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                 }
             }
         }
-        ActiveAsr::DashScopeMultimodal(m) => {
-            debug_assert!(uses_global_timeout);
-            let audio_secs = m.buffer_duration_ms() as f64 / 1000.0;
-            let timeout_duration = whisper_transcribe_timeout(audio_secs);
-            match tokio::time::timeout(timeout_duration, m.transcribe()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    log::error!("[coord] QA: DashScope Fun-ASR-Flash transcribe failed: {e}");
-                    finish_qa_with_error(inner, format!("识别失败: {e}"));
-                    return Err(e.to_string());
-                }
-                Err(_) => {
-                    log::error!(
-                        "[coord] QA: DashScope Fun-ASR-Flash dynamic timeout {}s (audio {:.2}s)",
-                        timeout_duration.as_secs(),
-                        audio_secs
-                    );
-                    finish_qa_with_error(inner, "识别超时".to_string());
-                    return Err("dashscope multimodal global timeout".to_string());
-                }
-            }
-        }
-        ActiveAsr::ElevenLabs(e) => {
-            debug_assert!(uses_global_timeout);
-            let audio_secs = e.buffer_duration_ms() as f64 / 1000.0;
-            let timeout_duration = crate::asr::elevenlabs::transcribe_timeout(audio_secs);
-            tokio::select! {
-                result = tokio::time::timeout(timeout_duration, e.transcribe()) => match result {
-                    Ok(Ok(raw)) => raw,
-                    Ok(Err(error)) => {
-                        log::error!("[coord] QA: ElevenLabs ASR transcribe failed: {error}");
-                        finish_qa_with_error(inner, format!("识别失败: {error}"));
-                        return Err(error.to_string());
-                    }
-                    Err(_) => {
-                        finish_qa_with_error(inner, "识别超时".to_string());
-                        return Err("elevenlabs dynamic timeout".to_string());
-                    }
-                },
-                _ = wait_for_qa_processing_cancel(inner) => {
-                    e.cancel();
-                    finish_qa_idle_silently(inner);
-                    return Ok(());
-                }
-            }
-        }
         #[cfg(target_os = "windows")]
         ActiveAsr::FoundryLocalWhisper(local) => {
             debug_assert!(!uses_global_timeout);
-            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-            let timeout_duration = windows_local_asr_transcribe_timeout(audio_secs);
-            log::info!(
-                "[coord] QA Foundry Local Whisper transcribe: audio={:.2}s timeout={}s",
-                audio_secs,
-                timeout_duration.as_secs()
-            );
-            match local.transcribe(timeout_duration).await {
+            match local
+                .transcribe(foundry_audio_transcribe_timeout_duration())
+                .await
+            {
                 Ok(r) => {
                     schedule_foundry_local_asr_release(inner, AsrReleaseSession::Qa(qa_session_id));
                     r
@@ -983,14 +855,10 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
         #[cfg(target_os = "windows")]
         ActiveAsr::SherpaOnnxLocal(local) => {
             debug_assert!(!uses_global_timeout);
-            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-            let timeout_duration = windows_local_asr_transcribe_timeout(audio_secs);
-            log::info!(
-                "[coord] QA sherpa-onnx transcribe: audio={:.2}s timeout={}s",
-                audio_secs,
-                timeout_duration.as_secs()
-            );
-            match local.transcribe(timeout_duration).await {
+            match local
+                .transcribe(sherpa_audio_transcribe_timeout_duration())
+                .await
+            {
                 Ok(r) => {
                     schedule_sherpa_onnx_release(inner, AsrReleaseSession::Qa(qa_session_id));
                     r
@@ -1296,27 +1164,6 @@ pub(super) fn finish_qa_idle_silently(inner: &Arc<Inner>) {
     state.selection = None;
 }
 
-async fn wait_for_qa_processing_cancel(inner: &Arc<Inner>) {
-    loop {
-        if inner.qa_state.lock().cancelled {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
-async fn wait_for_overlay_dictation_cancel(inner: &Arc<Inner>, session_id: SessionId) {
-    loop {
-        {
-            let state = inner.state.lock();
-            if state.cancelled || state.session_id != session_id {
-                return;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
 pub(super) fn cancel_qa_session(inner: &Arc<Inner>) {
     let phase = inner.qa_state.lock().phase;
     if phase == QaPhase::Idle {
@@ -1386,111 +1233,4 @@ where
             should_cancel,
         )
         .await?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Read;
-    use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn overlay_elevenlabs_cancel_finishes_idle_without_error_capsule() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let request_started = Arc::new(AtomicBool::new(false));
-        let release_server = Arc::new(AtomicBool::new(false));
-        let server_started = Arc::clone(&request_started);
-        let server_release = Arc::clone(&release_server);
-        let server = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if server_release.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "timed out waiting for ElevenLabs overlay request"
-                        );
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept ElevenLabs overlay request failed: {error}"),
-                }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = [0u8; 4096];
-            assert!(stream.read(&mut request).unwrap() > 0);
-            server_started.store(true, Ordering::SeqCst);
-            while !server_release.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(10));
-            }
-        });
-
-        let coordinator = Coordinator::new();
-        let session_id = new_session_id();
-        {
-            let mut state = coordinator.inner.state.lock();
-            state.phase = SessionPhase::Listening;
-            state.cancelled = false;
-            state.session_id = session_id;
-        }
-        {
-            let mut state = coordinator.inner.qa_state.lock();
-            state.phase = QaPhase::Processing;
-            state.cancelled = false;
-        }
-
-        let asr = Arc::new(ElevenLabsBatchASR::new(
-            "synthetic-test-key".to_string(),
-            format!("http://{addr}/v1"),
-            crate::asr::elevenlabs::DEFAULT_MODEL.to_string(),
-        ));
-        crate::recorder::AudioConsumer::consume_pcm_chunk(asr.as_ref(), &vec![0u8; 32_000]);
-        super::super::resources::store_asr_for_session(
-            &coordinator.inner,
-            session_id,
-            ActiveAsr::ElevenLabs(asr),
-        );
-
-        let transcribe = tokio::spawn({
-            let inner = Arc::clone(&coordinator.inner);
-            async move { take_current_dictation_transcript_for_qa(&inner).await }
-        });
-
-        let request_wait = tokio::time::timeout(Duration::from_secs(5), async {
-            while !request_started.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        if request_wait.is_ok() {
-            cancel_session(&coordinator.inner);
-        }
-
-        let transcribe_result = tokio::time::timeout(Duration::from_secs(2), transcribe).await;
-        release_server.store(true, Ordering::SeqCst);
-        server.join().unwrap();
-
-        request_wait.expect("ElevenLabs overlay request did not start");
-        let result = transcribe_result
-            .expect("ElevenLabs overlay cancellation did not finish")
-            .expect("overlay transcription task panicked");
-        assert!(matches!(result, Ok(None)));
-        assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
-        assert_eq!(coordinator.inner.qa_state.lock().phase, QaPhase::Idle);
-        assert!(!coordinator.inner.qa_state.lock().cancelled);
-        assert_eq!(
-            *coordinator.inner.last_capsule_state.lock(),
-            Some(CapsuleState::Idle)
-        );
-    }
 }

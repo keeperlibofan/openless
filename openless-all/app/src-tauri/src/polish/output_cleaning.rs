@@ -107,7 +107,11 @@ pub(super) fn parse_think_close_at(text: &str, start: usize) -> Option<usize> {
     parse_think_tag_end(text, slash + '/'.len_utf8(), false)
 }
 
-pub(super) fn parse_think_tag_end(text: &str, tag_start: usize, allow_attributes: bool) -> Option<usize> {
+pub(super) fn parse_think_tag_end(
+    text: &str,
+    tag_start: usize,
+    allow_attributes: bool,
+) -> Option<usize> {
     let tag_end = tag_start.checked_add("think".len())?;
     if tag_end > text.len() || !text[tag_start..tag_end].eq_ignore_ascii_case("think") {
         return None;

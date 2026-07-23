@@ -6,22 +6,16 @@
 //! `volcengine.rs`.
 
 pub mod bailian;
-pub mod dashscope_multimodal;
-pub mod elevenlabs;
 mod frame;
 pub mod local;
 pub mod mimo;
 pub mod pcm;
-pub mod qwen_realtime;
 pub mod volcengine;
 pub mod wav;
 pub mod whisper;
 
 pub use bailian::{BailianCredentials, BailianRealtimeASR};
-pub use dashscope_multimodal::DashScopeMultimodalASR;
-pub use elevenlabs::ElevenLabsBatchASR;
 pub use mimo::MimoBatchASR;
-pub use qwen_realtime::{Qwen3RealtimeASR, Qwen3RealtimeCredentials};
 pub use volcengine::{VolcengineCredentials, VolcengineStreamingASR};
 pub use whisper::WhisperBatchASR;
 
