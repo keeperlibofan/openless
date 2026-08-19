@@ -7,6 +7,7 @@ from openless_fcitx4_bridge import (
     HotkeySpec,
     HotkeyState,
     OpenLessInterface,
+    dispatch_hotkey_edge,
     dictation_signal_edges,
 )
 from openless_x11_insert import (
@@ -28,6 +29,42 @@ class DictationSignalEdgesTest(unittest.TestCase):
 
 class FakeKeymap:
     pass
+
+
+class DualSourceHotkeyDispatchTest(unittest.TestCase):
+    class FakeInterface:
+        def __init__(self, hotkeys: HotkeyState) -> None:
+            self.hotkeys = hotkeys
+            self.dictation_events: list[tuple[int, int, bool]] = []
+
+        def DictationKeyEvent(self, sym: int, states: int, is_press: bool) -> None:
+            self.dictation_events.append((sym, states, is_press))
+
+        def QaShortcutEvent(self, _sym: int, _states: int, _is_press: bool) -> None:
+            return None
+
+        def TranslationModifierEvent(
+            self,
+            _sym: int,
+            _states: int,
+            _is_press: bool,
+        ) -> None:
+            return None
+
+    def test_raw_and_grab_sources_emit_each_physical_edge_once(self) -> None:
+        hotkeys = HotkeyState(FakeKeymap())
+        hotkeys.dictation = HotkeySpec(sym=0xFFEA, primary_keycode=108)
+        interface = self.FakeInterface(hotkeys)
+
+        self.assertTrue(dispatch_hotkey_edge(interface, 108, True, mode="hold"))
+        self.assertFalse(dispatch_hotkey_edge(interface, 108, True, mode="hold"))
+        self.assertTrue(dispatch_hotkey_edge(interface, 108, False, mode="hold"))
+        self.assertFalse(dispatch_hotkey_edge(interface, 108, False, mode="hold"))
+
+        self.assertEqual(
+            interface.dictation_events,
+            [(0xFFEA, 0, True), (0xFFEA, 0, False)],
+        )
 
 
 class FakeDictationSuppressor:

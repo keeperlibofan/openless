@@ -42,6 +42,8 @@ OPENLESS_IFACE = "org.fcitx.Fcitx.OpenLess1"
 ALT_KEYSYMS = {0xFFE9, 0xFFEA}  # Alt_L / Alt_R
 X11_ANY_MODIFIER = 1 << 15
 X11_GRAB_MODE_ASYNC = 1
+X11_KEY_PRESS = 2
+X11_KEY_RELEASE = 3
 
 LOG = logging.getLogger("openless-fcitx4-bridge")
 PREFERENCES_PATH = Path(
@@ -167,7 +169,6 @@ class X11Keymap:
             if (code := self.keysym_to_keycode(sym))
         }
 
-
 @dataclass
 class HotkeySpec:
     sym: int = 0
@@ -197,8 +198,31 @@ class XErrorEvent(ctypes.Structure):
     ]
 
 
+class XKeyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("keycode", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
 class XEvent(ctypes.Union):
-    _fields_ = [("pad", ctypes.c_long * 24)]
+    _fields_ = [
+        ("xkey", XKeyEvent),
+        ("pad", ctypes.c_long * 24),
+    ]
 
 
 class X11DictationSuppressor:
@@ -239,6 +263,8 @@ class X11DictationSuppressor:
         self._x11.XPending.argtypes = [ctypes.c_void_p]
         self._x11.XPending.restype = ctypes.c_int
         self._x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(XEvent)]
+        self._x11.XConnectionNumber.argtypes = [ctypes.c_void_p]
+        self._x11.XConnectionNumber.restype = ctypes.c_int
         self._x11.XSetErrorHandler.argtypes = [ctypes.c_void_p]
         self._x11.XSetErrorHandler.restype = ctypes.c_void_p
 
@@ -316,10 +342,24 @@ class X11DictationSuppressor:
     def is_suppressing(self, spec: HotkeySpec) -> bool:
         return self.eligible(spec) and self._active_keycode == spec.primary_keycode
 
-    def drain_events(self) -> None:
+    def connection_fd(self) -> int:
+        if not self._display:
+            return -1
+        return int(self._x11.XConnectionNumber(self._display))
+
+    def drain_key_events(self) -> tuple[tuple[int, bool], ...]:
+        edges: list[tuple[int, bool]] = []
         event = XEvent()
         while self._display and self._x11.XPending(self._display):
             self._x11.XNextEvent(self._display, ctypes.byref(event))
+            event_type = int(event.xkey.type)
+            keycode = int(event.xkey.keycode)
+            if (
+                event_type in {X11_KEY_PRESS, X11_KEY_RELEASE}
+                and keycode == self._active_keycode
+            ):
+                edges.append((keycode, event_type == X11_KEY_PRESS))
+        return tuple(edges)
 
     def clear(self) -> None:
         if not self._display or not self._active_keycode:
@@ -415,6 +455,31 @@ class HotkeyState:
                 if (group := self.keymap.modifier_keycodes(modifier))
             ],
         )
+
+
+def dispatch_hotkey_edge(
+    interface: object,
+    keycode: int,
+    is_press: bool,
+    mode: str,
+) -> bool:
+    """Merge raw-XInput and passive-grab edges without double dispatch."""
+    hotkeys = interface.hotkeys
+    was_pressed = hotkeys.update_pressed(keycode, is_press)
+    if was_pressed == is_press:
+        return False
+
+    if hotkeys.dictation.matches(keycode, hotkeys.pressed):
+        spec = hotkeys.dictation
+        for signal_is_press in dictation_signal_edges(mode, is_press):
+            interface.DictationKeyEvent(spec.sym, spec.states, signal_is_press)
+    if hotkeys.qa.matches(keycode, hotkeys.pressed):
+        spec = hotkeys.qa
+        interface.QaShortcutEvent(spec.sym, spec.states, is_press)
+    if hotkeys.translation.matches(keycode, hotkeys.pressed):
+        spec = hotkeys.translation
+        interface.TranslationModifierEvent(spec.sym, spec.states, is_press)
+    return True
 
 
 class X11TextInserter:
@@ -677,26 +742,12 @@ async def monitor_xinput(interface: OpenLessInterface) -> None:
             is_press = current_event == "RawKeyPress"
             current_event = None
 
-            was_pressed = hotkeys.update_pressed(keycode, is_press)
-            if interface.dictation_suppressor is not None:
-                with contextlib.suppress(Exception):
-                    interface.dictation_suppressor.drain_events()
-
-            # Suppress X11 auto-repeat for modifier-only/toggle bindings.
-            if is_press and was_pressed:
-                continue
-
-            if hotkeys.dictation.matches(keycode, hotkeys.pressed):
-                spec = hotkeys.dictation
-                mode = read_dictation_mode()
-                for signal_is_press in dictation_signal_edges(mode, is_press):
-                    interface.DictationKeyEvent(spec.sym, spec.states, signal_is_press)
-            if hotkeys.qa.matches(keycode, hotkeys.pressed):
-                spec = hotkeys.qa
-                interface.QaShortcutEvent(spec.sym, spec.states, is_press)
-            if hotkeys.translation.matches(keycode, hotkeys.pressed):
-                spec = hotkeys.translation
-                interface.TranslationModifierEvent(spec.sym, spec.states, is_press)
+            dispatch_hotkey_edge(
+                interface,
+                keycode,
+                is_press,
+                mode=read_dictation_mode(),
+            )
 
         stderr = b""
         if process.stderr is not None:
@@ -707,6 +758,33 @@ async def monitor_xinput(interface: OpenLessInterface) -> None:
             stderr.decode("utf-8", errors="replace").strip(),
         )
         await asyncio.sleep(1)
+
+
+async def monitor_suppressed_key_events(
+    interface: OpenLessInterface,
+    suppressor: X11DictationSuppressor,
+) -> None:
+    """Consume KeyRelease from the same X11 connection that owns XGrabKey."""
+    connection_fd = suppressor.connection_fd()
+    if connection_fd < 0:
+        raise RuntimeError("X11 suppression connection is unavailable")
+
+    loop = asyncio.get_running_loop()
+    readable = asyncio.Event()
+    loop.add_reader(connection_fd, readable.set)
+    try:
+        while True:
+            await readable.wait()
+            readable.clear()
+            for keycode, is_press in suppressor.drain_key_events():
+                dispatch_hotkey_edge(
+                    interface,
+                    keycode,
+                    is_press,
+                    mode=read_dictation_mode(),
+                )
+    finally:
+        loop.remove_reader(connection_fd)
 
 
 async def main() -> None:
@@ -743,13 +821,21 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: not stop.done() and stop.set_result(None))
 
-    monitor = asyncio.create_task(monitor_xinput(openless))
+    monitors = [asyncio.create_task(monitor_xinput(openless))]
+    if dictation_suppressor is not None:
+        monitors.append(
+            asyncio.create_task(
+                monitor_suppressed_key_events(openless, dictation_suppressor)
+            )
+        )
     try:
         await stop
     finally:
-        monitor.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await monitor
+        for monitor in monitors:
+            monitor.cancel()
+        for monitor in monitors:
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
         status_overlay.close()
         if dictation_suppressor is not None:
             dictation_suppressor.close()
