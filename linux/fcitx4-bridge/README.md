@@ -23,6 +23,10 @@ instead of requiring a desktop migration to Fcitx5.
   accelerator layer before the `V` in `Ctrl+V` is sent.
 - A rounded status overlay for recording, ASR, polishing, success, and errors.
 - Live microphone level visualization while recording.
+- Hold-release watchdog: if OpenLess exits or stops responding while the
+  recording overlay is active, releasing the dictation key clears the stale
+  overlay and stops its microphone-level capture after a one-second grace
+  period. Normal recognizing/polishing status cancels this fallback.
 - Ordered-background-completion protection: an older result never covers a new
   active recording state.
 - A draggable overlay whose position is persisted in

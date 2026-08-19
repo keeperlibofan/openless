@@ -7,6 +7,7 @@ from openless_fcitx4_bridge import (
     HotkeySpec,
     HotkeyState,
     OpenLessInterface,
+    StatusOverlay,
     dispatch_hotkey_edge,
     dictation_signal_edges,
 )
@@ -36,6 +37,7 @@ class DualSourceHotkeyDispatchTest(unittest.TestCase):
         def __init__(self, hotkeys: HotkeyState) -> None:
             self.hotkeys = hotkeys
             self.dictation_events: list[tuple[int, int, bool]] = []
+            self.recording_cleanup_requests = 0
 
         def DictationKeyEvent(self, sym: int, states: int, is_press: bool) -> None:
             self.dictation_events.append((sym, states, is_press))
@@ -51,6 +53,9 @@ class DualSourceHotkeyDispatchTest(unittest.TestCase):
         ) -> None:
             return None
 
+        def schedule_recording_release_cleanup(self) -> None:
+            self.recording_cleanup_requests += 1
+
     def test_raw_and_grab_sources_emit_each_physical_edge_once(self) -> None:
         hotkeys = HotkeyState(FakeKeymap())
         hotkeys.dictation = HotkeySpec(sym=0xFFEA, primary_keycode=108)
@@ -65,6 +70,104 @@ class DualSourceHotkeyDispatchTest(unittest.TestCase):
             interface.dictation_events,
             [(0xFFEA, 0, True), (0xFFEA, 0, False)],
         )
+        self.assertEqual(interface.recording_cleanup_requests, 1)
+
+    def test_toggle_release_does_not_schedule_hold_overlay_cleanup(self) -> None:
+        hotkeys = HotkeyState(FakeKeymap())
+        hotkeys.dictation = HotkeySpec(sym=0xFFEA, primary_keycode=108)
+        hotkeys.update_pressed(108, True)
+        interface = self.FakeInterface(hotkeys)
+
+        self.assertTrue(dispatch_hotkey_edge(interface, 108, False, mode="toggle"))
+
+        self.assertEqual(
+            interface.dictation_events,
+            [(0xFFEA, 0, True), (0xFFEA, 0, False)],
+        )
+        self.assertEqual(interface.recording_cleanup_requests, 0)
+
+
+class StatusOverlayStateTest(unittest.TestCase):
+    def test_background_success_keeps_active_recording_for_release_cleanup(
+        self,
+    ) -> None:
+        overlay = StatusOverlay()
+        overlay._send = lambda _payload: None
+
+        overlay.set_text("🎤 收音中...")
+        overlay.set_text("✅ 已插入")
+
+        self.assertTrue(overlay.recording_active)
+        self.assertTrue(overlay.clear_if_recording())
+        self.assertFalse(overlay.recording_active)
+
+    def test_recognizing_status_ends_recording_state(self) -> None:
+        overlay = StatusOverlay()
+        overlay._send = lambda _payload: None
+
+        overlay.set_text("🎤 收音中...")
+        overlay.set_text("🔄 识别中...")
+
+        self.assertFalse(overlay.recording_active)
+        self.assertFalse(overlay.clear_if_recording())
+
+
+class RecordingOverlayCleanupTest(unittest.IsolatedAsyncioTestCase):
+    class FakeStatusOverlay:
+        def __init__(self) -> None:
+            self.recording_active = True
+            self.clear_calls = 0
+
+        def set_text(self, text: str) -> None:
+            if "收音中" in text:
+                self.recording_active = True
+            elif "已插入" not in text:
+                self.recording_active = False
+
+        def clear(self) -> None:
+            self.recording_active = False
+            self.clear_calls += 1
+
+        def clear_if_recording(self) -> bool:
+            if not self.recording_active:
+                return False
+            self.clear()
+            return True
+
+    async def test_hold_release_clears_recording_overlay_if_app_stops_responding(
+        self,
+    ) -> None:
+        hotkeys = HotkeyState(FakeKeymap())
+        hotkeys.dictation = HotkeySpec(sym=0xFFEA, primary_keycode=108)
+        hotkeys.update_pressed(108, True)
+        overlay = self.FakeStatusOverlay()
+        interface = OpenLessInterface(
+            hotkeys=hotkeys,
+            status_overlay=overlay,
+            recording_release_cleanup_delay=0.01,
+        )
+
+        dispatch_hotkey_edge(interface, 108, False, mode="hold")
+        await asyncio.sleep(0.03)
+
+        self.assertEqual(overlay.clear_calls, 1)
+
+    async def test_normal_post_release_status_cancels_overlay_cleanup(self) -> None:
+        hotkeys = HotkeyState(FakeKeymap())
+        hotkeys.dictation = HotkeySpec(sym=0xFFEA, primary_keycode=108)
+        hotkeys.update_pressed(108, True)
+        overlay = self.FakeStatusOverlay()
+        interface = OpenLessInterface(
+            hotkeys=hotkeys,
+            status_overlay=overlay,
+            recording_release_cleanup_delay=0.02,
+        )
+
+        dispatch_hotkey_edge(interface, 108, False, mode="hold")
+        interface.SetAuxDown("🔄 识别中...")
+        await asyncio.sleep(0.04)
+
+        self.assertEqual(overlay.clear_calls, 0)
 
 
 class FakeDictationSuppressor:

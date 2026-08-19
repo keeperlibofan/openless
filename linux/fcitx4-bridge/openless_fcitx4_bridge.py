@@ -473,6 +473,14 @@ def dispatch_hotkey_edge(
         spec = hotkeys.dictation
         for signal_is_press in dictation_signal_edges(mode, is_press):
             interface.DictationKeyEvent(spec.sym, spec.states, signal_is_press)
+        if mode == "hold" and not is_press:
+            schedule_cleanup = getattr(
+                interface,
+                "schedule_recording_release_cleanup",
+                None,
+            )
+            if callable(schedule_cleanup):
+                schedule_cleanup()
     if hotkeys.qa.matches(keycode, hotkeys.pressed):
         spec = hotkeys.qa
         interface.QaShortcutEvent(spec.sym, spec.states, is_press)
@@ -509,6 +517,7 @@ class X11TextInserter:
 class StatusOverlay:
     def __init__(self) -> None:
         self.process: subprocess.Popen[str] | None = None
+        self.recording_active = False
 
     def _ensure_process(self) -> subprocess.Popen[str]:
         if self.process is not None and self.process.poll() is None:
@@ -538,11 +547,22 @@ class StatusOverlay:
                     raise
 
     def set_text(self, text: str) -> None:
+        if "收音中" in text:
+            self.recording_active = True
+        elif not (self.recording_active and "已插入" in text):
+            self.recording_active = False
         self._send({"op": "set", "text": text})
 
     def clear(self) -> None:
+        self.recording_active = False
         if self.process is not None and self.process.poll() is None:
             self._send({"op": "clear"})
+
+    def clear_if_recording(self) -> bool:
+        if not self.recording_active:
+            return False
+        self.clear()
+        return True
 
     def close(self) -> None:
         if self.process is None or self.process.poll() is not None:
@@ -583,6 +603,7 @@ class OpenLessInterface(ServiceInterface):
         status_overlay: object | None = None,
         history_refresher: object | None = None,
         dictation_suppressor: object | None = None,
+        recording_release_cleanup_delay: float = 1.0,
     ) -> None:
         super().__init__(OPENLESS_IFACE)
         self.hotkeys = hotkeys
@@ -590,6 +611,35 @@ class OpenLessInterface(ServiceInterface):
         self.status_overlay = status_overlay or StatusOverlay()
         self.history_refresher = history_refresher or HistoryRefresher()
         self.dictation_suppressor = dictation_suppressor
+        self.recording_release_cleanup_delay = recording_release_cleanup_delay
+        self._recording_release_cleanup: asyncio.TimerHandle | None = None
+
+    def cancel_recording_release_cleanup(self) -> None:
+        cleanup = self._recording_release_cleanup
+        self._recording_release_cleanup = None
+        if cleanup is not None:
+            cleanup.cancel()
+
+    def schedule_recording_release_cleanup(self) -> None:
+        self.cancel_recording_release_cleanup()
+        loop = asyncio.get_running_loop()
+        self._recording_release_cleanup = loop.call_later(
+            self.recording_release_cleanup_delay,
+            self.clear_stale_recording_status,
+        )
+
+    def clear_stale_recording_status(self) -> None:
+        self._recording_release_cleanup = None
+        try:
+            if self.status_overlay.clear_if_recording():
+                LOG.warning(
+                    "cleared stale recording overlay after dictation-key release"
+                )
+        except Exception as exc:
+            LOG.warning(
+                "stale recording overlay cleanup failed: %s",
+                type(exc).__name__,
+            )
 
     def configure_dictation_suppression(self) -> bool:
         if self.hotkeys is None or self.dictation_suppressor is None:
@@ -640,6 +690,8 @@ class OpenLessInterface(ServiceInterface):
     def SetAuxDown(self, _text: "s") -> "":
         try:
             self.status_overlay.set_text(_text)
+            if not bool(getattr(self.status_overlay, "recording_active", False)):
+                self.cancel_recording_release_cleanup()
         except Exception as exc:
             LOG.warning("status overlay update failed: %s", type(exc).__name__)
         if "已插入" in _text:
@@ -651,6 +703,7 @@ class OpenLessInterface(ServiceInterface):
 
     @method()
     def ClearAuxDown(self) -> "":
+        self.cancel_recording_release_cleanup()
         try:
             self.status_overlay.clear()
         except Exception as exc:
